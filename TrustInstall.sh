@@ -98,6 +98,9 @@ INSTALL_STATUS=""                                            # Result code of fi
 INSTALL_LOCATION=""                                          # Location prefix where files were installed/linked
 DEPS_INSTALLED=0                                             # Dependency counter total
 DEPS_LIST=""                                                 # String collection of dependencies resolved and added
+declare -a REPORT_INSTALLED=()                               # List of packages installed in this transaction
+declare -a REPORT_UPDATED=()                                 # List of packages upgraded/updated in this transaction
+declare -a REPORT_DELETED=()                                 # List of packages removed/deleted in this transaction
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EARLY SETUP — must succeed or we die
@@ -278,6 +281,151 @@ human_size() {
     fi
 }
 
+# @description Stateful parser of DNF transaction summary dry-run output.
+#              Populates global REPORT arrays.
+# @param $1 string Dry-run output text from DNF command.
+parse_dnf_dry_run() {
+    local dry_run_text="$1"
+    local state="NONE"
+    local line
+    
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        local trimmed
+        trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        
+        if [[ "$trimmed" =~ ^Installing ]]; then
+            state="INSTALL"
+            continue
+        elif [[ "$trimmed" =~ ^Upgrading ]]; then
+            state="UPDATE"
+            continue
+        elif [[ "$trimmed" =~ ^Removing ]]; then
+            state="DELETE"
+            continue
+        elif [[ "$trimmed" =~ ^Downgrading ]]; then
+            state="DOWNGRADE"
+            continue
+        elif [[ "$trimmed" =~ ^Transaction\ Summary ]] || [[ "$trimmed" =~ ^=== ]]; then
+            state="NONE"
+            continue
+        fi
+        
+        if [[ "$state" != "NONE" ]] && [[ "$line" =~ ^[[:space:]]+[^[:space:]]+ ]]; then
+            local pkg arch ver repo size
+            read -r pkg arch ver repo size <<< "$line"
+            
+            if [[ -n "$pkg" ]] && [[ -n "$ver" ]] && [[ "$pkg" != "Package" ]] && [[ "$pkg" != "Installing" ]] && [[ "$pkg" != "Upgrading" ]] && [[ "$pkg" != "Removing" ]]; then
+                case "$state" in
+                    INSTALL)
+                        REPORT_INSTALLED+=("${pkg} (${ver})")
+                        ;;
+                    UPDATE|DOWNGRADE)
+                        REPORT_UPDATED+=("${pkg} (${ver})")
+                        ;;
+                    DELETE)
+                        REPORT_DELETED+=("${pkg} (${ver})")
+                        ;;
+                esac
+            fi
+        fi
+    done <<< "$dry_run_text"
+}
+
+# @description Prints a beautifully colorized summary table of all package changes.
+print_final_report() {
+    if [[ ${#REPORT_INSTALLED[@]} -eq 0 ]] && \
+       [[ ${#REPORT_UPDATED[@]} -eq 0 ]] && \
+       [[ ${#REPORT_DELETED[@]} -eq 0 ]]; then
+        echo
+        echo_yellow "  No package changes were made."
+        echo
+        return
+    fi
+
+    echo
+    echo "${C_BOLD}  ┌──────────────────────────────────────────────────────────────────────────────┐${C_RESET}"
+    printf "  ${C_BOLD}│${C_RESET} %-76s ${C_BOLD}│${C_RESET}\n" "$(echo_bold "FINAL TRANSACTION SUMMARY REPORT")"
+    echo "${C_BOLD}  ├────────────────────────────────────────┬──────────┬──────────────────────────┤${C_RESET}"
+    printf "  ${C_BOLD}│${C_RESET} %-38s ${C_BOLD}│${C_RESET} %-8s ${C_BOLD}│${C_RESET} %-24s ${C_BOLD}│${C_RESET}\n" "Package Name" "Action" "Version/Details"
+    echo "${C_BOLD}  ├────────────────────────────────────────┼──────────┼──────────────────────────┤${C_RESET}"
+
+    # Helper function to print a table row
+    print_row() {
+        local name="$1"
+        local action="$2"
+        local details="$3"
+        local action_color="$4"
+        
+        local name_trunc="${name:0:38}"
+        local details_trunc="${details:0:24}"
+        
+        printf "  ${C_BOLD}│${C_RESET} %-38s ${C_BOLD}│${C_RESET} ${action_color}%-8s${C_RESET} ${C_BOLD}│${C_RESET} %-24s ${C_BOLD}│${C_RESET}\n" \
+            "$name_trunc" "$action" "$details_trunc"
+    }
+
+    local item
+    for item in "${REPORT_DELETED[@]}"; do
+        local name="$item"
+        local details=""
+        if [[ "$item" =~ ^(.*)[[:space:]]+\((.*)\)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            details="${BASH_REMATCH[2]}"
+        fi
+        print_row "$name" "DELETED" "$details" "$C_RED"
+    done
+
+    for item in "${REPORT_UPDATED[@]}"; do
+        local name="$item"
+        local details=""
+        if [[ "$item" =~ ^(.*)[[:space:]]+\((.*)\)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            details="${BASH_REMATCH[2]}"
+        fi
+        print_row "$name" "UPDATED" "$details" "$C_BLUE"
+    done
+
+    for item in "${REPORT_INSTALLED[@]}"; do
+        local name="$item"
+        local details=""
+        if [[ "$item" =~ ^(.*)[[:space:]]+\((.*)\)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            details="${BASH_REMATCH[2]}"
+        fi
+        print_row "$name" "INSTALLED" "$details" "$C_GREEN"
+    done
+
+    echo "${C_BOLD}  └────────────────────────────────────────┴──────────┴──────────────────────────┘${C_RESET}"
+    echo
+}
+
+# @description Checks if the selected package name is already installed on the system.
+#              If it exists, prompts the user to uninstall it before continuing.
+check_and_remove_existing() {
+    if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+        local rpm_name
+        rpm_name="$(rpm -qp --queryformat '%{name}' "$SELECTED_PATH" 2>/dev/null || echo "")"
+        if [[ -n "$rpm_name" ]] && rpm -q "$rpm_name" &>/dev/null; then
+            local installed_version
+            installed_version="$(rpm -q --queryformat '%{version}-%{release}' "$rpm_name" 2>/dev/null || echo "unknown")"
+            echo
+            echo_yellow "  ⚠ Package '${rpm_name}' is already installed (Version: ${installed_version})."
+            if ask_yes_no "Do you want to uninstall the existing version and install the new one?" "Y"; then
+                echo "  Removing existing package '${rpm_name}'..."
+                if sudo dnf remove -y "$rpm_name"; then
+                    echo_green "  ✅ Successfully removed the old version."
+                    REPORT_DELETED+=("${rpm_name} (${installed_version})")
+                    # Invalidate cached dry-run because transaction profile changed
+                    DNF_DRY_RUN_OUTPUT=""
+                else
+                    echo_red "  ❌ Failed to remove the old version. Proceeding anyway."
+                fi
+            else
+                abort "Installation aborted by user (existing package preserved)."
+            fi
+        fi
+    fi
+}
+
 # ──────────────────────────────────────────────────────────────────────────────
 # STAGE 0 — ENVIRONMENT PRE-FLIGHT CHECKS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -289,10 +437,26 @@ preflight_checks() {
     local critical_errors=()
 
     # Step 1: Detect exact Linux distribution names and version IDs
+    local is_redhat=false
+    if [[ -f /etc/redhat-release ]]; then
+        is_redhat=true
+    fi
     if [[ -f /etc/os-release ]]; then
         OS_NAME="$(grep -oP '^PRETTY_NAME="?\K[^"]+' /etc/os-release || true)"
         OS_VERSION="$(grep -oP '^VERSION_ID="?\K[^"]+' /etc/os-release || true)"
         OS_ID="$(grep -oP '^ID="?\K[^"]+' /etc/os-release || true)"
+        local id_like
+        id_like="$(grep -oP '^ID_LIKE="?\K[^"]+' /etc/os-release || true)"
+        if [[ "$OS_ID" =~ ^(fedora|rhel|centos|almalinux|rocky|ol)$ ]] || [[ "$id_like" =~ (fedora|rhel|centos) ]]; then
+            is_redhat=true
+        fi
+    fi
+
+    if ! $is_redhat; then
+        echo
+        echo_red "  ❌ Error: This script is only supported on Red Hat-based distributions (e.g., Fedora, RHEL, CentOS, Rocky Linux, AlmaLinux)."
+        echo
+        exit 1
     fi
 
     if [[ -z "$OS_NAME" ]]; then
@@ -436,10 +600,8 @@ preflight_checks() {
         for warn in "${warnings[@]}"; do
             echo "  ${C_YELLOW}⚠${C_RESET}  ${warn}"
         done
+        echo "  Proceeding..."
         echo
-        if ! ask_yes_no "Continue despite warnings?" "N"; then
-            abort "Aborted by user due to warnings."
-        fi
     fi
 }
 
@@ -563,41 +725,7 @@ discover_packages() {
 # STAGE 2 — PACKAGE SELECTION & RISK ANALYSIS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# @description Prompts the user to select one of the detected packages.
-# @globals SELECTED_INDEX, SELECTED_PATH, SELECTED_TYPE, SELECTED_SIZE, SELECTED_SHA256, SELECTED_NAME
-select_package() {
-    local total="${#ALL_PACKAGES[@]}"
-    local input=""
-    local idx=0
-
-    while true; do
-        read -r -p "  Select a package by number (or 'q' to quit): " input
-        if [[ "$input" == "q" ]] || [[ "$input" == "0" ]]; then
-            abort
-        fi
-        if ! [[ "$input" =~ ^[0-9]+$ ]]; then
-            echo "  ${C_YELLOW}Please enter a valid number.${C_RESET}"
-            continue
-        fi
-        idx="$((10#$input))"
-        if [[ "$idx" -lt 1 ]] || [[ "$idx" -gt "$total" ]]; then
-            echo "  ${C_YELLOW}Number out of range. Please enter 1-${total}.${C_RESET}"
-            continue
-        fi
-        break
-    done
-
-    # Map selected package information to target globals
-    SELECTED_INDEX="$idx"
-    SELECTED_PATH="${ALL_PACKAGES_PATHS[$((idx-1))]}"
-    SELECTED_TYPE="${ALL_PACKAGES_TYPES[$((idx-1))]}"
-    SELECTED_SIZE="${ALL_PACKAGES_SIZES[$((idx-1))]}"
-    SELECTED_SHA256="${ALL_PACKAGES_SHA256[$((idx-1))]}"
-    SELECTED_NAME="$(basename "$SELECTED_PATH")"
-
-    echo
-    echo "  Selected: ${SELECTED_NAME}"
-}
+# Package selection is handled dynamically in main coordinator.
 
 # @description Simulates RPM installation using sudo dnf install --assumeno.
 #              Parses and reports dependencies, package upgrades, conflicts, and dangerous removals.
@@ -802,10 +930,10 @@ pgp_verification() {
     pkg_file="$(basename "$SELECTED_PATH")"
     local pkg_name_noext="${pkg_file%.*}"
     
-    # Search for matching detached signature files
+    # Search for matching detached signature files (supporting all PGP/GPG extensions case-insensitively)
     local sig_candidates=()
     local ext
-    for ext in sig asc pgp; do
+    for ext in sig SIG asc ASC pgp PGP gpg GPG signature SIGNATURE sign SIGN; do
         [[ -f "${pkg_dir}/${pkg_file}.${ext}" ]] && sig_candidates+=("${pkg_dir}/${pkg_file}.${ext}")
         [[ -f "${pkg_dir}/${pkg_name_noext}.${ext}" ]] && sig_candidates+=("${pkg_dir}/${pkg_name_noext}.${ext}")
     done
@@ -821,17 +949,12 @@ pgp_verification() {
         [[ "$exists" == "false" ]] && unique_sig_candidates+=("$cand")
     done
     
-    # Request PGP/GPG signature confirmation from user
+    # Automatically select the first candidate (no questions asked)
     local found_sig=""
-    for cand in "${unique_sig_candidates[@]}"; do
-        local cand_name
-        cand_name="$(basename "$cand")"
-        echo
-        if ask_yes_no "Found PGP/GPG signature file: '${cand_name}'. Is this the correct signature file for this package?" "Y"; then
-            found_sig="$cand"
-            break
-        fi
-    done
+    if [[ ${#unique_sig_candidates[@]} -gt 0 ]]; then
+        found_sig="${unique_sig_candidates[0]}"
+        echo "  Automatically selected PGP/GPG signature file: $(basename "$found_sig")"
+    fi
 
     # Verify using detached signature if confirmed
     if [[ -n "$found_sig" ]]; then
@@ -839,12 +962,8 @@ pgp_verification() {
         echo "  Verifying PGP/GPG signature using: $(basename "$found_sig")"
         
         if [[ "$HAS_PGP" == "false" ]]; then
-            echo_yellow "  ⚠ GnuPG is not installed."
-            if ask_yes_no "Install gnupg2 now?" "Y"; then
-                sudo dnf install -y gnupg2 && HAS_PGP=true
-            else
-                abort "Verification aborted: GnuPG required for detached signature checks."
-            fi
+            echo_yellow "  ⚠ GnuPG is not installed. Installing gnupg2 automatically..."
+            sudo dnf install -y gnupg2 && HAS_PGP=true
         fi
 
         local verify_output
@@ -853,106 +972,72 @@ pgp_verification() {
         if echo "$verify_output" | grep -qi "good signature"; then
             PGP_VERIFIED=true
             PGP_SIGNER="$(echo "$verify_output" | grep -oP '"([^"]+)"' | awk 'NR==1' || echo "Unknown")"
-            PGP_KEY_ID="$(echo "$verify_output" | grep -oP 'key ID [0-9A-Fa-f]+' | awk 'NR==1' || echo "unknown")"
+            PGP_KEY_ID="$(echo "$verify_output" | grep -i "using" | grep -oP '\b[0-9A-Fa-f]{8,40}\b' | head -n 1 || echo "unknown")"
             echo_green "  ✅ PGP/GPG DETACHED SIGNATURE VERIFIED SUCCESSFULLY"
             echo "  Signer: ${PGP_SIGNER} (${PGP_KEY_ID})"
             echo
-            if ask_yes_no "Would you like to install the package now?" "Y"; then
-                if [[ "$SELECTED_TYPE" == "RPM" ]]; then
-                    risk_analysis
-                    install_rpm
-                else
-                    install_appimage
-                fi
+            if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                check_and_remove_existing
+                risk_analysis
+                install_rpm || abort "Installation failed."
+            else
+                install_appimage || abort "AppImage integration failed."
             fi
             return 0
         elif echo "$verify_output" | grep -qi "no public key\|public key .* not found\|keyserver"; then
             local key_id
-            key_id="$(echo "$verify_output" | grep -oP 'key ID [0-9A-Fa-f]+' | awk '{print $NF}' || true)"
-            [[ -z "$key_id" ]] && key_id="$(echo "$verify_output" | grep -oP 'Key ID [0-9A-Fa-f]+' | awk '{print $NF}' || true)"
+            key_id="$(echo "$verify_output" | grep -i "using" | grep -oP '\b[0-9A-Fa-f]{8,40}\b' | head -n 1 || true)"
             
             echo_yellow "  ⚠ PGP/GPG Key Not Found (NOKEY)"
-            echo "  The signature is valid, but the public key is not trusted/imported."
-            if [[ -n "$key_id" ]]; then
-                echo "  Key ID: ${key_id}"
-                echo
-                echo "  Options:"
-                echo "    [1] Import key from keyserver (keyserver.ubuntu.com)"
-                echo "    [2] Import key from keyserver (keys.openpgp.org)"
-                echo "    [3] Proceed with installation anyway"
-                echo "    [4] Abort installation"
-                echo
-                local opt
-                read -r -p "  Choose [1-4]: " opt
-                case "$opt" in
-                    1|2)
-                        local keyserver="keyserver.ubuntu.com"
-                        [[ "$opt" -eq 2 ]] && keyserver="keys.openpgp.org"
-                        echo "  Fetching key from ${keyserver}..."
-                        local tmp_key
-                        tmp_key="$(mktemp)"
-                        TEMP_DIRS+=("$tmp_key")
-                        if gpg --keyserver "$keyserver" --recv-keys "$key_id" 2>/dev/null && gpg --export --armor "$key_id" > "$tmp_key"; then
-                            if [[ "$SELECTED_TYPE" == "RPM" ]]; then
-                                echo "  Importing key into RPM database..."
-                                if sudo rpm --import "$tmp_key"; then
-                                    echo_green "  ✅ Key imported to RPM database."
-                                fi
-                            fi
-                            gpg --import "$tmp_key" 2>/dev/null || true
-                            
-                            verify_output="$(gpg --verify "$found_sig" "$SELECTED_PATH" 2>&1 || true)"
-                            if echo "$verify_output" | grep -qi "good signature"; then
-                                PGP_VERIFIED=true
-                                PGP_SIGNER="Imported Key (${key_id})"
-                                PGP_KEY_ID="${key_id}"
-                                echo_green "  ✅ PGP/GPG DETACHED SIGNATURE VERIFIED"
-                                if ask_yes_no "Would you like to install the package now?" "Y"; then
-                                    if [[ "$SELECTED_TYPE" == "RPM" ]]; then
-                                        risk_analysis
-                                        install_rpm
-                                    else
-                                        install_appimage
-                                    fi
-                                fi
-                                return 0
-                            fi
-                        fi
-                        echo_red "  ❌ Failed to verify signature after key import."
-                        if ask_yes_no "Do you want to proceed anyway?" "N"; then
-                            if [[ "$SELECTED_TYPE" == "RPM" ]]; then
-                                risk_analysis
-                                install_rpm
-                            else
-                                install_appimage
-                            fi
-                        else
-                            abort "Installation aborted."
-                        fi
-                        ;;
-                    3)
-                        if [[ "$SELECTED_TYPE" == "RPM" ]]; then
-                            risk_analysis
-                            install_rpm
-                        else
-                            install_appimage
-                        fi
-                        ;;
-                    *)
-                        abort "Installation aborted."
-                        ;;
-                esac
-            else
-                if ask_yes_no "Do you want to proceed without verification?" "N"; then
+            echo "  Attempting to retrieve public key (${key_id}) automatically..."
+            
+            local import_success=false
+            local keyserver
+            for keyserver in "keyserver.ubuntu.com" "keys.openpgp.org"; do
+                echo "  Fetching key from ${keyserver}..."
+                local tmp_key
+                tmp_key="$(mktemp)"
+                TEMP_DIRS+=("$tmp_key")
+                if gpg --keyserver "$keyserver" --recv-keys "$key_id" 2>/dev/null && gpg --export --armor "$key_id" > "$tmp_key" 2>/dev/null; then
                     if [[ "$SELECTED_TYPE" == "RPM" ]]; then
-                        risk_analysis
-                        install_rpm
-                    else
-                        install_appimage
+                        sudo rpm --import "$tmp_key" &>/dev/null || true
                     fi
-                else
-                    abort "Installation aborted."
+                    gpg --import "$tmp_key" &>/dev/null || true
+                    import_success=true
+                    break
                 fi
+            done
+            
+            if $import_success; then
+                echo_green "  ✅ Successfully imported public key."
+                verify_output="$(gpg --verify "$found_sig" "$SELECTED_PATH" 2>&1 || true)"
+                if echo "$verify_output" | grep -qi "good signature"; then
+                    PGP_VERIFIED=true
+                    PGP_SIGNER="Imported Key (${key_id})"
+                    PGP_KEY_ID="${key_id}"
+                    echo_green "  ✅ PGP/GPG DETACHED SIGNATURE VERIFIED"
+                    if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                        check_and_remove_existing
+                        risk_analysis
+                        install_rpm || abort "Installation failed."
+                    else
+                        install_appimage || abort "AppImage integration failed."
+                    fi
+                    return 0
+                fi
+            fi
+            
+            echo_red "  ❌ Failed to verify signature after key import."
+            if ask_yes_no "Do you want to proceed anyway?" "N"; then
+                if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                    check_and_remove_existing
+                    risk_analysis
+                    install_rpm || abort "Installation failed."
+                else
+                    install_appimage || abort "AppImage integration failed."
+                fi
+            else
+                abort "Installation aborted."
             fi
             return 0
         else
@@ -964,10 +1049,11 @@ pgp_verification() {
             echo
             if ask_yes_no "Do you want to proceed with installation anyway (Dangerous)?" "N"; then
                 if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                    check_and_remove_existing
                     risk_analysis
-                    install_rpm
+                    install_rpm || abort "Installation failed."
                 else
-                    install_appimage
+                    install_appimage || abort "AppImage integration failed."
                 fi
             else
                 abort "Installation aborted due to BAD signature."
@@ -997,17 +1083,12 @@ pgp_verification() {
         [[ "$cexists" == "false" ]] && unique_checksum_candidates+=("$ccand")
     done
 
-    # Request checksum file confirmation from user
+    # Automatically select the first checksum candidate (no questions asked)
     local found_checksum=""
-    for ccand in "${unique_checksum_candidates[@]}"; do
-        local ccand_name
-        ccand_name="$(basename "$ccand")"
-        echo
-        if ask_yes_no "Found checksum file: '${ccand_name}'. Is this the correct checksum file for this package?" "Y"; then
-            found_checksum="$ccand"
-            break
-        fi
-    done
+    if [[ ${#unique_checksum_candidates[@]} -gt 0 ]]; then
+        found_checksum="${unique_checksum_candidates[0]}"
+        echo "  Automatically selected checksum file: $(basename "$found_checksum")"
+    fi
 
     # Verify using checksum file if confirmed
     if [[ -n "$found_checksum" ]]; then
@@ -1029,10 +1110,7 @@ pgp_verification() {
         calculated_sha="$(echo "$SELECTED_SHA256" | tr '[:upper:]' '[:lower:]')"
 
         if [[ -z "$expected_sha" ]]; then
-            echo_yellow "  ⚠ Could not find a valid 64-character SHA256 checksum in $(basename "$found_checksum")."
-            if ! ask_yes_no "Proceed to other verification checks?" "Y"; then
-                abort "Verification aborted."
-            fi
+            echo_yellow "  ⚠ Could not find a valid 64-character SHA256 checksum in $(basename "$found_checksum"). Proceeding..."
         else
             echo "  Expected SHA256: ${expected_sha}"
             echo "  Calculated SHA256: ${calculated_sha}"
@@ -1043,13 +1121,12 @@ pgp_verification() {
                 PGP_SIGNER="Verified via $(basename "$found_checksum")"
                 echo_green "  ✅ CHECKSUM MATCHED SUCCESSFULLY!"
                 echo
-                if ask_yes_no "Would you like to install the package now?" "Y"; then
-                    if [[ "$SELECTED_TYPE" == "RPM" ]]; then
-                        risk_analysis
-                        install_rpm
-                    else
-                        install_appimage
-                    fi
+                if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                    check_and_remove_existing
+                    risk_analysis
+                    install_rpm || abort "Installation failed."
+                else
+                    install_appimage || abort "AppImage integration failed."
                 fi
                 return 0
             else
@@ -1061,10 +1138,11 @@ pgp_verification() {
                 echo
                 if ask_yes_no "Do you want to proceed with installation anyway (Dangerous)?" "N"; then
                     if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                        check_and_remove_existing
                         risk_analysis
-                        install_rpm
+                        install_rpm || abort "Installation failed."
                     else
-                        install_appimage
+                        install_appimage || abort "AppImage integration failed."
                     fi
                 else
                     abort "Installation aborted due to checksum mismatch."
@@ -1077,31 +1155,19 @@ pgp_verification() {
     # Fallback to embedded signature or manual verification
     if [[ "$SELECTED_TYPE" == "AppImage" ]]; then
         echo
-        echo "  ${C_BLUE}ℹ${C_RESET} No PGP/GPG signature or checksum file confirmed. Checking manually."
+        echo "  ${C_BLUE}ℹ${C_RESET} No PGP/GPG signature or checksum file found."
         echo "  Computed SHA256: ${SELECTED_SHA256}"
         echo
-        if ask_yes_no "Does this checksum match the developer's official value?" "N"; then
-            PGP_VERIFIED=true
-            PGP_SIGNER="User-verified SHA256"
-            echo_green "  ✅ Checksum confirmed."
-            if ask_yes_no "Proceed to install/integrate AppImage?" "Y"; then
-                install_appimage
-            else
-                abort "Exiting without installation."
-            fi
+        if ask_yes_no "Do you want to proceed with installing this unverified AppImage?" "N"; then
+            install_appimage || abort "AppImage integration failed."
         else
-            echo_yellow "  ⚠ Warning: Checksum was not confirmed."
-            if ask_yes_no "Do you want to install this unverified AppImage anyway?" "N"; then
-                install_appimage
-            else
-                abort "Aborted due to unconfirmed checksum."
-            fi
+            abort "Aborted: AppImage verification declined."
         fi
         return 0
     fi
 
     echo
-    echo "  No signature or checksum file confirmed. Checking embedded RPM signature..."
+    echo "  No signature or checksum file found. Checking embedded RPM signature..."
     
     local rpm_k_output
     rpm_k_output="$(rpm -K "$SELECTED_PATH" 2>&1 || true)"
@@ -1113,10 +1179,9 @@ pgp_verification() {
         echo_green "  ✅ EMBEDDED PGP/GPG SIGNATURE VERIFIED SUCCESSFULLY"
         echo "  Signer: ${PGP_SIGNER} (Key ID: ${PGP_KEY_ID})"
         echo
-        if ask_yes_no "Would you like to install the package now?" "Y"; then
-            risk_analysis
-            install_rpm
-        fi
+        check_and_remove_existing
+        risk_analysis
+        install_rpm || abort "Installation failed."
     elif echo "$rpm_k_output" | grep -qi "BAD"; then
         echo_red "  ❌ CRITICAL WARNING: EMBEDDED PGP/GPG SIGNATURE IS INVALID OR CORRUPT (BAD)!"
         echo "  --------------------------------------------------------"
@@ -1125,8 +1190,9 @@ pgp_verification() {
         echo "  --------------------------------------------------------"
         echo
         if ask_yes_no "Do you want to proceed with installation anyway (Dangerous)?" "N"; then
+            check_and_remove_existing
             risk_analysis
-            install_rpm
+            install_rpm || abort "Installation failed."
         else
             abort "Installation aborted due to BAD signature."
         fi
@@ -1140,59 +1206,49 @@ pgp_verification() {
         if [[ -n "$key_id" ]]; then
             echo "  Key ID: ${key_id}"
             echo
-            echo "  Options:"
-            echo "    [1] Import key from keyserver (keyserver.ubuntu.com)"
-            echo "    [2] Import key from keyserver (keys.openpgp.org)"
-            echo "    [3] Proceed with installation anyway"
-            echo "    [4] Abort installation"
-            echo
-            local opt
-            read -r -p "  Choose [1-4]: " opt
-            case "$opt" in
-                1|2)
-                    local keyserver="keyserver.ubuntu.com"
-                    [[ "$opt" -eq 2 ]] && keyserver="keys.openpgp.org"
-                    echo "  Fetching key from ${keyserver}..."
-                    local tmp_key
-                    tmp_key="$(mktemp)"
-                    TEMP_DIRS+=("$tmp_key")
-                    if gpg --keyserver "$keyserver" --recv-keys "$key_id" 2>/dev/null && gpg --export --armor "$key_id" > "$tmp_key"; then
-                        if sudo rpm --import "$tmp_key"; then
-                            echo_green "  ✅ Key imported successfully."
-                            rpm_k_output="$(rpm -K "$SELECTED_PATH" 2>&1 || true)"
-                            if echo "$rpm_k_output" | grep -qi "signatures OK\|gpg OK\|pgp OK"; then
-                                PGP_VERIFIED=true
-                                PGP_SIGNER="Imported Key (${key_id})"
-                                PGP_KEY_ID="${key_id}"
-                                echo_green "  ✅ PGP/GPG SIGNATURE VERIFIED"
-                                if ask_yes_no "Would you like to install the package now?" "Y"; then
-                                    risk_analysis
-                                    install_rpm
-                                fi
-                                return 0
-                            fi
-                        fi
+            echo "  Attempting to retrieve public key (${key_id}) automatically..."
+            local import_success=false
+            local keyserver
+            for keyserver in "keyserver.ubuntu.com" "keys.openpgp.org"; do
+                echo "  Fetching key from ${keyserver}..."
+                local tmp_key
+                tmp_key="$(mktemp)"
+                TEMP_DIRS+=("$tmp_key")
+                if gpg --keyserver "$keyserver" --recv-keys "$key_id" 2>/dev/null && gpg --export --armor "$key_id" > "$tmp_key" 2>/dev/null; then
+                    if sudo rpm --import "$tmp_key" &>/dev/null; then
+                        gpg --import "$tmp_key" &>/dev/null || true
+                        import_success=true
+                        break
                     fi
-                    echo_red "  ❌ Failed to verify signature after key import."
-                    if ask_yes_no "Do you want to proceed anyway?" "N"; then
-                        risk_analysis
-                        install_rpm
-                    else
-                        abort "Installation aborted."
-                    fi
-                    ;;
-                3)
+                fi
+            done
+            if $import_success; then
+                echo_green "  ✅ Successfully imported public key."
+                rpm_k_output="$(rpm -K "$SELECTED_PATH" 2>&1 || true)"
+                if echo "$rpm_k_output" | grep -qi "signatures OK\|gpg OK\|pgp OK"; then
+                    PGP_VERIFIED=true
+                    PGP_SIGNER="Imported Key (${key_id})"
+                    PGP_KEY_ID="${key_id}"
+                    echo_green "  ✅ PGP/GPG SIGNATURE VERIFIED"
+                    check_and_remove_existing
                     risk_analysis
-                    install_rpm
-                    ;;
-                *)
-                    abort "Installation aborted."
-                    ;;
-            esac
+                    install_rpm || abort "Installation failed."
+                    return 0
+                fi
+            fi
+            echo_red "  ❌ Failed to verify signature after key import."
+            if ask_yes_no "Do you want to proceed anyway?" "N"; then
+                check_and_remove_existing
+                risk_analysis
+                install_rpm || abort "Installation failed."
+            else
+                abort "Installation aborted."
+            fi
         else
             if ask_yes_no "Do you want to proceed without verification?" "N"; then
+                check_and_remove_existing
                 risk_analysis
-                install_rpm
+                install_rpm || abort "Installation failed."
             else
                 abort "Installation aborted."
             fi
@@ -1200,8 +1256,9 @@ pgp_verification() {
     else
         echo_yellow "  ⚠ Package is not signed (Unsigned)"
         if ask_yes_no "Do you want to install this unsigned package?" "N"; then
+            check_and_remove_existing
             risk_analysis
-            install_rpm
+            install_rpm || abort "Installation failed."
         else
             abort "Installation aborted."
         fi
@@ -1271,23 +1328,17 @@ install_rpm() {
     echo "  Available disk space: ${DISK_SPACE_AVAIL}"
     echo
 
-    if ! ask_yes_no "Proceed with installation?" "N"; then
-        abort "Installation cancelled by user."
-    fi
-
+    # Proceed automatically
     echo
-    echo "  Running: sudo dnf install \"${full_path}\""
+    echo "  Running: sudo dnf install -y \"${full_path}\""
     echo
 
     # Step 1: Run DNF with live console output.
-    # We do not capture output here so the user sees progress and PGP/key prompts live.
     local install_rc=0
-    sudo dnf install "$full_path" || install_rc=$?
+    sudo dnf install -y "$full_path" || install_rc=$?
     if [[ "$install_rc" -ne 0 ]]; then
         local install_output=""
-        # Step 2: Re-run silently ONLY on failure to capture error messages for diagnosis.
-        {  
-        install_output="$(sudo dnf install "$full_path" 2>&1)" || true; } 2>/dev/null
+        { install_output="$(sudo dnf install -y "$full_path" 2>&1)" || true; } 2>/dev/null
         echo_red "  ❌  Installation failed (exit code: ${install_rc})."
         echo
         if echo "$install_output" | grep -qi "already installed"; then
@@ -1301,31 +1352,13 @@ install_rpm() {
         fi
         return 1
     fi
-    if false; then  # dead-code block to satisfy old structure
-    local install_output
-    install_output="$(sudo dnf install "$full_path" 2>&1)" || {
-        local exit_code=$?
-        echo_red "  ❌  Installation failed (exit code: ${exit_code})."
-        echo
-        echo "  DNF output:"
-        echo "$install_output"
-        echo
-        if echo "$install_output" | grep -qi "already installed"; then
-            echo "  Suggestion: The package may already be installed."
-        elif echo "$install_output" | grep -qi "nothing provides\|missing dependency\|requires:"; then
-            echo "  Suggestion: Missing dependencies. Check if all required repos are enabled."
-        elif echo "$install_output" | grep -qi "wrong architecture\|arch"; then
-            echo "  Suggestion: The package architecture does not match your system."
-        elif echo "$install_output" | grep -qi "no match\|not found"; then
-            echo "  Suggestion: The file may have been moved or deleted."
-        else
-            echo "  See the DNF output above for details."
-        fi
-        return 1
-    }
-    fi  # end dead-code block
 
     echo_green "  ✅  Installation completed successfully."
+
+    # Parse transaction dry-run to populate report
+    if [[ -n "$DNF_DRY_RUN_OUTPUT" ]]; then
+        parse_dnf_dry_run "$DNF_DRY_RUN_OUTPUT"
+    fi
 
     # Step 3: Query RPM database to record package files destination path
     INSTALL_LOCATION="$(rpm -ql "$pkg_name" 2>/dev/null | awk 'NR<=5' | tr '\n' ' ' || echo "See 'rpm -ql ${pkg_name}'")"
@@ -1359,9 +1392,6 @@ install_rpm() {
 # STAGE 4B — SAFE APPIMAGE INTEGRATION
 # ──────────────────────────────────────────────────────────────────────────────
 
-# @description Integrates AppImage files by copying to selected folder, updating permissions,
-#              checking FUSE dependency, and extracting desktop entries and icons.
-# @globals SELECTED_PATH, HAS_FUSE, HAS_DESKTOP, SELECTED_SHA256
 install_appimage() {
     local appimage_path="$SELECTED_PATH"
     local appimage_name="$(basename "$appimage_path")"
@@ -1375,110 +1405,52 @@ install_appimage() {
     fi
     local dest_dir=""
     local dest_path=""
-    local choice=""
 
-    echo
     print_box "APPIMAGE INTEGRATION"
 
     # ── Step 1: Ensure FUSE dependencies are met ────────────────────────
     if ! $HAS_FUSE; then
         echo
-        echo_yellow "  ⚠  FUSE is not installed."
-        echo
-        echo "  AppImages require FUSE (Filesystem in Userspace) to run."
-        echo "  Without FUSE, AppImages will not execute."
-        echo
-        echo "  ${C_BLUE}Fix:${C_RESET} sudo dnf install fuse fuse-libs"
-        echo
-        if ask_yes_no "Install FUSE now?" "Y"; then
-            echo
-            # Select modern fuse3 package on modern Fedora with fallback to legacy fuse package
-            local fuse_pkg="fuse3 fuse3-libs"
-            if ! dnf info fuse3 &>/dev/null 2>&1; then
-                fuse_pkg="fuse fuse-libs"
-            fi
-            echo "  Running: sudo dnf install ${fuse_pkg}"
-            # No -y: let user review dependencies list transaction details
-            # shellcheck disable=SC2086
-            sudo dnf install $fuse_pkg || {
-                echo_red "  Failed to install FUSE."
-                if ! ask_yes_no "Continue without FUSE? (AppImage will not run)" "N"; then
-                    abort
-                fi
-            }
-            # Recheck dependencies status
-            if rpm -q fuse &>/dev/null || rpm -q fuse-libs &>/dev/null || \
-               rpm -q fuse3 &>/dev/null || rpm -q fuse3-libs &>/dev/null; then
-                HAS_FUSE=true
-                echo_green "  ✅  FUSE installed."
-            fi
+        echo_yellow "  ⚠  FUSE is not installed. Installing FUSE automatically..."
+        local fuse_pkg="fuse3 fuse3-libs"
+        if ! dnf info fuse3 &>/dev/null 2>&1; then
+            fuse_pkg="fuse fuse-libs"
+        fi
+        sudo dnf install -y $fuse_pkg || true
+        # Recheck dependencies status
+        if rpm -q fuse &>/dev/null || rpm -q fuse-libs &>/dev/null || \
+           rpm -q fuse3 &>/dev/null || rpm -q fuse3-libs &>/dev/null; then
+            HAS_FUSE=true
+            echo_green "  ✅  FUSE installed."
         else
-            echo_yellow "  Skipping FUSE installation. AppImage may not run."
-            if ! ask_yes_no "Continue integration anyway?" "N"; then
-                abort
-            fi
+            echo_yellow "  ⚠ FUSE could not be installed automatically. AppImage may not execute."
         fi
     fi
 
-    # ── Step 2: Assign target path directory ─────────────────────────────
-    echo
-    echo "  Choose destination directory for the AppImage:"
-    echo "    [1] ~/Applications/ (recommended — user-local, no sudo needed)"
-    echo "    [2] Current directory (leave in place)"
-    echo "    [3] Enter custom path"
-    echo
-    read -r -p "  Choose [1-3]: " choice
-    case "$choice" in
-        1)
-            dest_dir="${HOME}/Applications"
-            ;;
-        2)
-            dest_dir="$START_DIR"
-            ;;
-        3)
-            read -r -p "  Enter custom path: " dest_dir
-            dest_dir="${dest_dir/#\~/${HOME}}"
-            ;;
-        *)
-            dest_dir="${HOME}/Applications"
-            echo_yellow "  Defaulting to ~/Applications/"
-            ;;
-    esac
-
-    # Create target directory folder if absent
+    # ── Step 2: Assign target path directory (automatic) ──────────────────
+    dest_dir="${HOME}/Applications"
     if [[ ! -d "$dest_dir" ]]; then
-        echo
-        echo "  Directory '${dest_dir}' does not exist."
-        if ask_yes_no "Create it?" "Y"; then
-            mkdir -p "$dest_dir" || {
-                echo_red "  Failed to create directory."
-                abort
-            }
-            echo_green "  ✅  Created: ${dest_dir}"
-        else
-            dest_dir="$START_DIR"
-            echo "  Using current directory instead."
-        fi
+        mkdir -p "$dest_dir" || dest_dir="$START_DIR"
     fi
-
     dest_path="${dest_dir}/${appimage_name}"
 
-    # ── Step 3: Change permissions and copy executable ──────────────────
-    echo
-    print_box "PERMISSION CHANGE PREVIEW"
-    echo
-    echo "  ${C_BLUE}File:${C_RESET}     ${dest_path}"
-    echo "  ${C_BLUE}Current:${C_RESET}  $(ls -l "$appimage_path" | awk '{print $1 " (" $3 ":" $4 ")"}')"
-    echo "  ${C_BLUE}New:${C_RESET}      -rwxr-xr-x (executable)"
-    echo
-    echo "  This allows the file to be run as a program."
-    echo "  Only do this for AppImages from trusted sources."
-    echo
-
-    if ! ask_yes_no "Apply permission change and copy to destination?" "N"; then
-        abort "AppImage integration cancelled."
+    # Check if AppImage already exists
+    if [[ -f "$dest_path" ]]; then
+        echo
+        echo_yellow "  ⚠ An AppImage named '${appimage_name}' already exists at destination."
+        if ask_yes_no "Do you want to remove the existing version and install the new one?" "Y"; then
+            echo "  Removing existing version and launcher files..."
+            rm -f "$dest_path"
+            rm -f "${HOME}/.local/share/applications/${appimage_basename}.desktop"
+            rm -f "${HOME}/.local/share/icons/${appimage_basename}".*
+            echo_green "  ✅ Successfully removed the old version."
+            REPORT_DELETED+=("${appimage_name} (AppImage)")
+        else
+            abort "Integration aborted by user (existing version preserved)."
+        fi
     fi
 
+    # ── Step 3: Change permissions and copy executable (automatic) ─────────
     echo
     echo "  Copying: ${appimage_path} → ${dest_path}"
     cp "$appimage_path" "$dest_path" || {
@@ -1489,21 +1461,18 @@ install_appimage() {
         echo_red "  Failed to make AppImage executable."
         abort
     }
-    echo_green "  ✅  AppImage copied and made executable."
+    echo_green "  ✅  AppImage integrated."
 
     # ── Step 4: Extract desktop launcher configuration files ─────────────
     if $HAS_DESKTOP; then
-        echo
-        echo "  Optionally, create a desktop launcher for the application menu."
-        if ask_yes_no "Create desktop launcher?" "Y"; then
-            extract_desktop_entry "$dest_path" "$appimage_basename" "$dest_dir" "$appimage_name"
-        else
-            echo "  Skipping desktop entry."
-        fi
+        extract_desktop_entry "$dest_path" "$appimage_basename" "$dest_dir" "$appimage_name"
     else
         echo
         echo "  ${C_BLUE}ℹ${C_RESET}  No desktop environment detected. Skipping desktop launcher creation."
     fi
+
+    # Record installation
+    REPORT_INSTALLED+=("${appimage_name} (AppImage)")
 
     # ── Final report summary ─────────────────────────────────────────────
     echo
@@ -1537,14 +1506,6 @@ install_appimage() {
     echo
 }
 
-# @description Extracts desktop entries and application icons from AppImage using --appimage-extract.
-#              Employs multiple heuristics to locate high-res icons and modifies shortcuts to use
-#              absolute AppImage paths, updating update-desktop-database if present.
-# @param $1 string Absolute path to AppImage file.
-# @param $2 string Clean basename of AppImage (no extension).
-# @param $3 string Target destination directory.
-# @param $4 string Original filename of AppImage.
-# @globals TEMP_DIRS, HAS_DESKTOP, HAS_UPDATE_DESKTOP_DB
 extract_desktop_entry() {
     local appimage_path="$1"
     local appimage_basename="$2"
@@ -1562,61 +1523,32 @@ extract_desktop_entry() {
 
     echo
     echo "  Extracting AppImage metadata (temporary)..."
-    echo "  This may take a moment for large AppImages."
-
     cp "$appimage_path" "$tmpdir/" || return 1
     local tmp_appimage="${tmpdir}/$(basename "$appimage_path")"
     chmod +x "$tmp_appimage" || return 1
 
-    # Execute extraction tool built into AppImage structures
-    echo
-    echo "  ${C_BLUE}Command:${C_RESET} ${tmp_appimage##*/} --appimage-extract"
-    echo
-    if (cd "$tmpdir" && "$tmp_appimage" --appimage-extract 2>/dev/null); then
+    if (cd "$tmpdir" && "$tmp_appimage" --appimage-extract &>/dev/null); then
         echo "  Extraction successful."
     else
-        echo_yellow "  Extraction failed. The AppImage may not support extraction."
-        echo "  A launcher can still be created manually."
-        if ! ask_yes_no "Create basic desktop entry without icon?" "N"; then
-            return 1
-        fi
+        echo_yellow "  Extraction failed. Creating a basic desktop entry manually."
         create_manual_desktop "$appimage_path" "$appimage_basename" "" "$appimage_basename"
         return 0
     fi
 
     local squash_dir="${tmpdir}/squashfs-root"
     if [[ ! -d "$squash_dir" ]]; then
-        echo_yellow "  No squashfs-root directory found after extraction."
-        if ! ask_yes_no "Create basic desktop entry without icon?" "N"; then
-            return 1
-        fi
+        echo_yellow "  squashfs-root not found. Creating basic desktop entry."
         create_manual_desktop "$appimage_path" "$appimage_basename" "" "$appimage_basename"
         return 0
     fi
 
     # ── ICON EXTRACTION ──────────────────────────────────────────────────
-    # Strategy priorities for icon candidate selection:
-    #   1. .DirIcon — AppImage standard root icon file
-    #   2. Icon referenced by .desktop Icon= key (resolved against squashfs-root)
-    #   3. Highest-resolution PNG matching the application name
-    #   4. Any largest PNG in the extracted tree
-    #   5. Any SVG icon
-    #   6. Any XPM icon as last resort
-    echo
-    echo "  ${C_BLUE}Searching for embedded icons...${C_RESET}"
-
     local chosen_icon=""
 
-    # Strategy 1: .DirIcon (AppImage standard icon at the root of the image)
     if [[ -f "${squash_dir}/.DirIcon" ]]; then
         chosen_icon="${squash_dir}/.DirIcon"
-        echo "  ${C_GREEN}Found .DirIcon${C_RESET} (AppImage standard icon)"
     fi
 
-    # Strategy 2: Parse every .desktop file for Icon= key and resolve the
-    # referenced icon name against files in squashfs-root.
-    # Desktop Icon keys often reference names like "app" or "app-icon"
-    # without extension. We resolve by searching for exact match with extensions.
     if [[ -z "$chosen_icon" ]]; then
         local desktop_candidates=()
         while IFS= read -r -d '' dcand; do
@@ -1629,25 +1561,19 @@ extract_desktop_entry() {
             if [[ -n "$icon_key" ]]; then
                 local icon_name="${icon_key#Icon=}"
                 icon_name="${icon_name%% *}"
-                # Try resolving icon_name against files in squashfs-root
-                # First: exact match with extension
                 local resolved=""
                 for ext in svg png xpm; do
-                    # Search in typical icon directories first
                     resolved="$(find "$squash_dir" -type f -iname "${icon_name}.${ext}" -print -quit 2>/dev/null || true)"
                     if [[ -n "$resolved" ]]; then
                         chosen_icon="$resolved"
-                        echo "  ${C_GREEN}Resolved icon from .desktop Icon= key:${C_RESET} $(basename "$resolved")"
                         break 2
                     fi
                 done
-                # Also try icon_name as a prefix (e.g., Icon=app → app-256.png)
                 if [[ -z "$chosen_icon" ]]; then
                     for ext in svg png xpm; do
                         resolved="$(find "$squash_dir" -type f -iname "${icon_name}*.${ext}" -print -quit 2>/dev/null || true)"
                         if [[ -n "$resolved" ]]; then
                             chosen_icon="$resolved"
-                            echo "  ${C_GREEN}Resolved icon from .desktop Icon= key:${C_RESET} $(basename "$resolved")"
                             break 2
                         fi
                     done
@@ -1656,7 +1582,6 @@ extract_desktop_entry() {
         done
     fi
 
-    # Strategy 3: Highest-resolution PNG matching the application basename
     if [[ -z "$chosen_icon" ]]; then
         local best_png=""
         local best_size=0
@@ -1665,7 +1590,6 @@ extract_desktop_entry() {
             local fname_lower
             fname_lower="$(basename "$png_candidate" | tr '[:upper:]' '[:lower:]')"
             local candidate_size=0
-            # Extract resolution hints from filename (e.g. app-256x256.png, app_128.png, 256.png)
             if [[ "$fname_lower" =~ ([0-9]+)x[0-9]+ ]]; then
                 candidate_size="${BASH_REMATCH[1]}"
             elif [[ "$fname_lower" =~ [-_]([0-9]+)[._] ]]; then
@@ -1673,7 +1597,6 @@ extract_desktop_entry() {
             elif [[ "$fname_lower" =~ [-_]([0-9]+)\.png ]]; then
                 candidate_size="${BASH_REMATCH[1]}"
             fi
-            # If the filename contains the app name, boost its priority higher
             local app_lower
             app_lower="$(echo "$appimage_basename" | tr '[:upper:]' '[:lower:]')"
             if [[ "$fname_lower" == *"${app_lower}"* ]]; then
@@ -1686,38 +1609,14 @@ extract_desktop_entry() {
         done < <(find "$squash_dir" -type f -iname '*.png' -print0 2>/dev/null)
         if [[ -n "$best_png" ]]; then
             chosen_icon="$best_png"
-            echo "  ${C_GREEN}Found PNG icon by resolution priority:${C_RESET} $(basename "$best_png")"
         fi
     fi
 
-    # Strategy 4: Any PNG (first found)
     if [[ -z "$chosen_icon" ]]; then
-        local any_png
-        any_png="$(find "$squash_dir" -type f -iname '*.png' -print -quit 2>/dev/null || true)"
-        if [[ -n "$any_png" ]]; then
-            chosen_icon="$any_png"
-            echo "  ${C_GREEN}Found PNG icon:${C_RESET} $(basename "$any_png")"
-        fi
+        chosen_icon="$(find "$squash_dir" -type f -iname '*.png' -print -quit 2>/dev/null || true)"
     fi
-
-    # Strategy 5: SVG icon
     if [[ -z "$chosen_icon" ]]; then
-        local any_svg
-        any_svg="$(find "$squash_dir" -type f -iname '*.svg' -print -quit 2>/dev/null || true)"
-        if [[ -n "$any_svg" ]]; then
-            chosen_icon="$any_svg"
-            echo "  ${C_GREEN}Found SVG icon:${C_RESET} $(basename "$any_svg")"
-        fi
-    fi
-
-    # Strategy 6: XPM icon as last resort
-    if [[ -z "$chosen_icon" ]]; then
-        local any_xpm
-        any_xpm="$(find "$squash_dir" -type f -iname '*.xpm' -print -quit 2>/dev/null || true)"
-        if [[ -n "$any_xpm" ]]; then
-            chosen_icon="$any_xpm"
-            echo "  ${C_GREEN}Found XPM icon:${C_RESET} $(basename "$any_xpm")"
-        fi
+        chosen_icon="$(find "$squash_dir" -type f -iname '*.svg' -print -quit 2>/dev/null || true)"
     fi
 
     # Install the chosen icon to user icons directory
@@ -1729,9 +1628,6 @@ extract_desktop_entry() {
         local icon_ext_lower
         icon_ext_lower="$(echo "$icon_ext" | tr '[:upper:]' '[:lower:]')"
 
-        # Determine final extension — SVG gets installed as-is since desktop
-        # environments natively support them. PNG and XPM keep their format.
-        # XPM is converted to PNG if ImageMagick is available for better support.
         local final_ext="$icon_ext_lower"
         if [[ "$icon_ext_lower" == "xpm" ]]; then
             if command -v convert &>/dev/null; then
@@ -1739,77 +1635,38 @@ extract_desktop_entry() {
             fi
         fi
 
-        echo
-        echo "  ┌── ICON INSTALLATION PREVIEW ─────────────────────────────────┐"
-        echo "  │ Source:      ${icon_filename}"
-        echo "  │ Destination: ~/.local/share/icons/${appimage_basename}.${final_ext}"
-        echo "  │ Format:      ${icon_ext_lower} → ${final_ext}"
-        echo "  └──────────────────────────────────────────────────────────────────┘"
-        echo
-
-        if ask_yes_no "Install this icon to ~/.local/share/icons/?" "Y"; then
-            local icon_dest="${HOME}/.local/share/icons/${appimage_basename}.${final_ext}"
-            mkdir -p "${HOME}/.local/share/icons"
-            cp "$chosen_icon" "$icon_dest" || {
-                echo_yellow "  Failed to copy icon."
-                icon_file=""
-            }
-            # Convert XPM to PNG if ImageMagick convert is present
+        local icon_dest="${HOME}/.local/share/icons/${appimage_basename}.${final_ext}"
+        mkdir -p "${HOME}/.local/share/icons"
+        if cp "$chosen_icon" "$icon_dest" 2>/dev/null; then
             if [[ "$icon_ext_lower" == "xpm" ]] && command -v convert &>/dev/null; then
                 convert "$icon_dest" "${HOME}/.local/share/icons/${appimage_basename}.png" 2>/dev/null || true
-                # Remove original xpm copy since we have the PNG conversion
                 rm -f "${icon_dest}" 2>/dev/null || true
                 icon_dest="${HOME}/.local/share/icons/${appimage_basename}.png"
             fi
             icon_file="$icon_dest"
-            echo_green "  ✅  Icon installed to ${icon_dest}"
+            echo "  Icon installed: ${icon_dest}"
         fi
-    else
-        echo_yellow "  No icon files found inside AppImage."
-        echo "  The desktop entry will use a generic application icon."
     fi
 
     # ── DESKTOP ENTRY EXTRACTION ──────────────────────────────────────
-    # Step 1: Search for .desktop launcher files in the extracted content
-    echo
-    echo "  ${C_BLUE}Searching for embedded .desktop launchers...${C_RESET}"
-
     local search_desktop
     search_desktop="$(find "$squash_dir" -maxdepth 3 -type f -iname '*.desktop' 2>/dev/null | awk 'NR==1' || true)"
     if [[ -n "$search_desktop" ]]; then
         extracted_desktop="$search_desktop"
-        echo "  ${C_GREEN}Desktop entry found:${C_RESET} $(basename "$extracted_desktop")"
-        echo
-
-        echo "  Original desktop file contents:"
-        echo "  ─────────────────────────────────────────────────────"
-        while IFS= read -r dline || [[ -n "$dline" ]]; do
-            echo "    ${dline}"
-        done < "$extracted_desktop"
-        echo "  ─────────────────────────────────────────────────────"
-        echo
-
-        # Step 2: Rebuild absolute paths for executable/icon mappings inside
-        # desktop configuration file — ensure Exec= and Icon= point to final locations
+        
         local modified_desktop="${tmpdir}/modified.desktop"
         local exec_path="${appimage_path}"
-        # Override exec path if dest_dir was provided and file exists there
         if [[ -n "$dest_dir_arg" ]] && [[ -n "$appimage_name_arg" ]] && [[ -f "${dest_dir_arg}/${appimage_name_arg}" ]]; then
             exec_path="${dest_dir_arg}/${appimage_name_arg}"
         fi
         local icon_path="${icon_file:-${appimage_basename}}"
 
-        # Write modified desktop entry: rewrite Exec= and Icon= lines to use
-        # the real installed location of the AppImage binary and the icon.
-        # Also strip any %F/%U arguments that may reference old paths.
         : > "$modified_desktop"
         while IFS= read -r dline || [[ -n "$dline" ]]; do
             if [[ "$dline" =~ ^Exec= ]]; then
-                # Preserve any %F/%U etc. arguments from original Exec line
                 local exec_args=""
                 local orig_exec="$dline"
                 orig_exec="${orig_exec#Exec=}"
-                # Extract trailing % placeholders (like %F, %U, %f, %u)
                 exec_args="$(echo "$orig_exec" | grep -oP '%[fFuUcCdDnNickvm]+' || true)"
                 echo "Exec=${exec_path} ${exec_args}" >> "$modified_desktop"
             elif [[ "$dline" =~ ^TryExec= ]]; then
@@ -1821,39 +1678,21 @@ extract_desktop_entry() {
             fi
         done < "$extracted_desktop"
 
-        # Show reconstructed desktop entry file preview before writing to filesystem
-        echo "  Modified desktop entry (will be written):"
-        echo "  ┌── DESKTOP ENTRY PREVIEW ─────────────────────────────────┐"
-        while IFS= read -r dline || [[ -n "$dline" ]]; do
-            printf "  │ %-60s │\n" "$dline"
-        done < "$modified_desktop"
-        echo "  └──────────────────────────────────────────────────────────┘"
-        echo
+        local desktop_dest="${HOME}/.local/share/applications/${appimage_basename}.desktop"
+        mkdir -p "${HOME}/.local/share/applications"
+        cp "$modified_desktop" "$desktop_dest"
+        chmod +x "$desktop_dest"
 
-        if ask_yes_no "Write this desktop file?" "Y"; then
-            local desktop_dest="${HOME}/.local/share/applications/${appimage_basename}.desktop"
-            mkdir -p "${HOME}/.local/share/applications"
-            cp "$modified_desktop" "$desktop_dest"
-            chmod +x "$desktop_dest"
-
-            # Update graphical databases to show shortcut in system application
-            # lists immediately
-            if $HAS_UPDATE_DESKTOP_DB; then
-                echo "  Running: update-desktop-database ~/.local/share/applications"
-                update-desktop-database "${HOME}/.local/share/applications" 2>/dev/null || true
-            fi
-            echo_green "  ✅  Desktop entry created."
+        if $HAS_UPDATE_DESKTOP_DB; then
+            update-desktop-database "${HOME}/.local/share/applications" 2>/dev/null || true
         fi
+        echo "  Desktop entry created: ${desktop_dest}"
     else
-        echo_yellow "  No .desktop file found in AppImage."
-        if ask_yes_no "Create a basic desktop entry manually?" "N"; then
-            local icon_param="${icon_file:-}"
-            create_manual_desktop "$appimage_path" "$appimage_basename" "$icon_param" "$appimage_basename"
-        fi
+        local icon_param="${icon_file:-}"
+        create_manual_desktop "$appimage_path" "$appimage_basename" "$icon_param" "$appimage_basename"
     fi
 }
 
-# Generates basic shortcut file manually if extraction yields no .desktop options.
 create_manual_desktop() {
     local exec_path="$1"
     local app_name="$2"
@@ -1869,26 +1708,15 @@ Type=Application
 Categories=Utility;
 Terminal=false"
 
-    echo
-    echo "  ┌── DESKTOP ENTRY PREVIEW ─────────────────────────────────┐"
-    while IFS= read -r dline; do
-        printf "  │ %-60s │\n" "$dline"
-    done <<< "$desktop_content"
-    echo "  └──────────────────────────────────────────────────────────┘"
-    echo
+    local desktop_dest="${HOME}/.local/share/applications/${desktop_name}.desktop"
+    mkdir -p "${HOME}/.local/share/applications"
+    echo "$desktop_content" > "$desktop_dest"
+    chmod +x "$desktop_dest"
 
-    if ask_yes_no "Write this desktop file?" "Y"; then
-        local desktop_dest="${HOME}/.local/share/applications/${desktop_name}.desktop"
-        mkdir -p "${HOME}/.local/share/applications"
-        echo "$desktop_content" > "$desktop_dest"
-        chmod +x "$desktop_dest"
-
-        if $HAS_UPDATE_DESKTOP_DB; then
-            echo "  Running: update-desktop-database ~/.local/share/applications"
-            update-desktop-database "${HOME}/.local/share/applications" 2>/dev/null || true
-        fi
-        echo_green "  ✅  Desktop entry created."
+    if $HAS_UPDATE_DESKTOP_DB; then
+        update-desktop-database "${HOME}/.local/share/applications" 2>/dev/null || true
     fi
+    echo "  Desktop entry created: ${desktop_dest}"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1910,35 +1738,113 @@ main() {
     # Stage 1 — Package discovery scan
     discover_packages
 
-    # Stage 2 — Selection & risk analysis dry-run
-    select_package
+    local total="${#ALL_PACKAGES[@]}"
+    local choice=""
+    local mode=""
+    local idx=0
 
-    echo "  Choose your action:"
-    echo "    [1] Verify PGP signature (Highly Recommended)"
-    echo "    [2] Install package directly"
-    echo
-    local action
     while true; do
-        read -r -p "  Choose [1-2] (or 'q' to quit): " action
-        [[ "$action" == "q" ]] && abort
-        [[ "$action" =~ ^[1-2]$ ]] && break
-        echo_yellow "  Please enter 1 or 2."
+        read -r -p "  Enter package number to install, or type 'all' to install all (or 'q' to quit): " choice
+        local clean_choice
+        clean_choice="$(echo "$choice" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+
+        if [[ "$clean_choice" == "q" ]] || [[ "$clean_choice" == "0" ]]; then
+            abort
+        fi
+
+        if [[ "$clean_choice" == "all" ]]; then
+            mode="all"
+            break
+        fi
+
+        if [[ "$clean_choice" =~ ^[0-9]+$ ]]; then
+            idx="$((10#$clean_choice))"
+            if [[ "$idx" -lt 1 ]] || [[ "$idx" -gt "$total" ]]; then
+                echo_yellow "  Number out of range. Please enter 1-${total} or 'all'."
+                continue
+            fi
+            mode="single"
+            break
+        fi
+
+        echo_yellow "  Invalid selection. Please choose a package number (1-${total}) or type 'all'."
     done
 
-    if [[ "$action" == "2" ]]; then
-        echo_yellow "  ⚠ WARNING: Installing unverified packages is a security risk."
-        if ! ask_yes_no "Do you want to proceed with the installation anyway?" "N"; then
-            abort "Installation cancelled."
-        fi
-        if [[ "$SELECTED_TYPE" == "RPM" ]]; then
-            risk_analysis
-            install_rpm
+    if [[ "$mode" == "single" ]]; then
+        # Map selected package information to target globals
+        SELECTED_INDEX="$idx"
+        SELECTED_PATH="${ALL_PACKAGES_PATHS[$((idx-1))]}"
+        SELECTED_TYPE="${ALL_PACKAGES_TYPES[$((idx-1))]}"
+        SELECTED_SIZE="${ALL_PACKAGES_SIZES[$((idx-1))]}"
+        SELECTED_SHA256="${ALL_PACKAGES_SHA256[$((idx-1))]}"
+        SELECTED_NAME="$(basename "$SELECTED_PATH")"
+
+        echo
+        echo "  Selected: ${SELECTED_NAME}"
+        echo
+
+        echo "  Choose your action:"
+        echo "    [1] Verify PGP/GPG signature (Highly Recommended)"
+        echo "    [2] Install package directly"
+        echo
+        local action
+        while true; do
+            read -r -p "  Choose [1-2] (or 'q' to quit): " action
+            [[ "$action" == "q" ]] && abort
+            [[ "$action" =~ ^[1-2]$ ]] && break
+            echo_yellow "  Please enter 1 or 2."
+        done
+
+        if [[ "$action" == "2" ]]; then
+            echo_yellow "  ⚠ WARNING: Installing unverified packages is a security risk."
+            if ! ask_yes_no "Do you want to proceed with the installation anyway?" "N"; then
+                abort "Installation cancelled."
+            fi
+            if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                check_and_remove_existing
+                risk_analysis
+                install_rpm || abort "Installation failed."
+            else
+                install_appimage || abort "AppImage integration failed."
+            fi
         else
-            install_appimage
+            pgp_verification
         fi
     else
-        pgp_verification
+        echo
+        echo_blue "  Installing all ${#ALL_PACKAGES_PATHS[@]} package(s) with PGP/GPG signature verification..."
+        echo
+        
+        local i
+        for ((i=0; i<${#ALL_PACKAGES_PATHS[@]}; i++)); do
+            # Reset verification/transaction states to prevent overlap
+            PGP_VERIFIED=false
+            PGP_SIGNER=""
+            PGP_KEY_ID=""
+            DNF_DRY_RUN_OUTPUT=""
+            DEPS_INSTALLED=0
+            INSTALL_STATUS=""
+            INSTALL_LOCATION=""
+            
+            # Set package variables for this index
+            SELECTED_INDEX="$((i+1))"
+            SELECTED_PATH="${ALL_PACKAGES_PATHS[i]}"
+            SELECTED_TYPE="${ALL_PACKAGES_TYPES[i]}"
+            SELECTED_SIZE="${ALL_PACKAGES_SIZES[i]}"
+            SELECTED_SHA256="${ALL_PACKAGES_SHA256[i]}"
+            SELECTED_NAME="$(basename "$SELECTED_PATH")"
+            
+            echo_bold "======================================================================"
+            echo_bold "  Processing Package [$((i+1))/${#ALL_PACKAGES_PATHS[@]}]: ${SELECTED_NAME}"
+            echo_bold "======================================================================"
+            
+            pgp_verification
+            echo
+        done
     fi
+
+    # Print final transaction report table
+    print_final_report
 
     echo
     echo_green "  All operations complete."
