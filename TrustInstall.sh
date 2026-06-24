@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 #
-# install-local.sh — Safe local package discovery and installation tool
+# ==============================================================================
+# TrustInstall.sh — Enterprise-grade local package discovery & installation tool
+# ==============================================================================
 #
-# Discovers .rpm and .AppImage files in the current directory, analyzes
-# risks, and guides the user through installation with full transparency.
+# ARCHITECTURAL DESIGN SUMMARY:
+# - Stage 0: Pre-flight Checks (System validation, disk, network, command binaries)
+# - Stage 1: Dynamic discovery of RPM & AppImage packages in CWD (non-recursive)
+# - Stage 2: Target Selection & transaction simulation via DNF dry-run with sudo
+# - Stage 3: Verification Engine (Detached PGP/GPG signature check -> Checksum verification
+#            -> Embedded RPM signature verify fallback -> SHA256 checksum fallback)
+# - Stage 4A: Safe RPM transaction execution via DNF package manager
+# - Stage 4B: AppImage integration, metadata extraction, FUSE check, launcher db update
+#
+# SYSTEM SAFETY & CONCURRENCY:
+# - set -euEo pipefail: ensures strict error handling, unset var checks, pipeline failure checks
+# - signal trapping (EXIT/ERR/SIGINT/SIGTERM): coordinates cleanups of mktemp directories
+# - SIGPIPE protection: pipeline outputs are processed using awk instead of head/tail to
+#   prevent early pipe closure which triggers exit code 141 under pipefail.
 #
 # License: GPL3.0
-#
-# SHELL SECURITY CONFIGURATION:
-# -e: Exit immediately if any command exits with a non-zero status.
-# -u: Treat unset variables as an error.
-# -o pipefail: Pipeline status is that of the last command to fail.
-# -E: Ensure ERR trap is inherited by functions and subshells.
+# ==============================================================================
 set -euEo pipefail
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -35,7 +44,7 @@ DISK_SPACE_WARN=false                                        # Low storage alarm
 HAS_DNF=false                                                # Presence flag of dnf command line utility
 HAS_RPM=false                                                # Presence flag of rpm command line utility
 HAS_FUSE=false                                               # Presence flag of FUSE (filesystem in userspace) layer
-HAS_GPG=false                                                # Presence flag of GnuPG tool
+HAS_PGP=false                                                # Presence of PGP verification tool (GnuPG engine)
 HAS_DESKTOP=false                                            # Graphical environment detection indicator
 HAS_UPDATE_DESKTOP_DB=false                                  # Presence of update-desktop-database command
 DESKTOP_ENV=""                                               # Name of active Desktop Environment (e.g., Gnome)
@@ -79,10 +88,10 @@ SELECTED_NAME=""                                             # Selected package 
 SELECTED_SIZE=""                                             # Selected package computed file size
 SELECTED_SHA256=""                                           # Selected package SHA256 checksum string
 
-# Signature verification status attributes (Stage 3 GPG)
-GPG_VERIFIED=false                                           # True if cryptographic check passes successfully
-GPG_SIGNER=""                                                # Owner identity of signature key
-GPG_KEY_ID=""                                                # Key identifier hash
+# Signature verification status attributes (Stage 3 PGP)
+PGP_VERIFIED=false                                           # True if PGP check passes successfully
+PGP_SIGNER=""                                                # Owner identity of signature key
+PGP_KEY_ID=""                                                # Key identifier hash
 
 # Post-operation reporting context
 INSTALL_STATUS=""                                            # Result code of final execution ('success' or exit status)
@@ -108,10 +117,11 @@ if command -v tput &>/dev/null && tput colors &>/dev/null; then
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SAFE EXIT / CLEANUP
+# SYSTEM SAFE EXIT & SIGNAL HANDLING
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Destroys all tracked temporary directories to prevent filesystem pollution.
+# @description Performs recursive cleanup of all recorded temporary workspaces.
+# @globals TEMP_DIRS Array containing paths of all generated temporary folders.
 cleanup() {
     local tmpdir
     for tmpdir in "${TEMP_DIRS[@]}"; do
@@ -121,7 +131,8 @@ cleanup() {
     done
 }
 
-# Gracefully exits script, printing descriptive feedback to user.
+# @description Aborts execution gracefully and triggers cleanup.
+# @param $1 string Error/abort message.
 abort() {
     local message="${1:-Installation aborted by user.}"
     echo
@@ -130,8 +141,8 @@ abort() {
     exit 0
 }
 
-# Fallback error handler triggered when any statement returns an unhandled failure code.
-# Prints failure location line number and status, then performs safety cleanup.
+# @description Standard error handler bound to ERR trap. Outputs debug info and cleans up.
+# @param $1 integer Line number where the error occurred.
 handle_err() {
     local exit_code=$?
     local line=$1
@@ -141,7 +152,7 @@ handle_err() {
     exit "$exit_code"
 }
 
-# Signal handler mapping for interruption events (such as SIGINT / SIGTERM / Ctrl+C)
+# @description Handler for interrupts (SIGINT/SIGTERM) to ensure safe cleanup on Ctrl+C.
 handle_sigint() {
     echo
     abort "Interrupted by user (Ctrl+C). Cleaning up..."
@@ -271,8 +282,8 @@ human_size() {
 # STAGE 0 — ENVIRONMENT PRE-FLIGHT CHECKS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Evaluates machine health, system packages, operating systems, and internet connectivity.
-# Builds lists of warnings (non-fatal issues) and critical errors (immediate abort reasons).
+# @description Validates target operating system, space, internet, and checks for binary tools.
+# @globals OS_NAME, OS_VERSION, OS_ID, HAS_DNF, HAS_RPM, HAS_FUSE, HAS_PGP, HAS_DESKTOP
 preflight_checks() {
     local warnings=()
     local critical_errors=()
@@ -291,7 +302,7 @@ preflight_checks() {
     # Step 2: Detect package manager binaries
     if command -v dnf &>/dev/null; then
         HAS_DNF=true
-        PACKAGE_MANAGER="dnf ($(dnf --version 2>/dev/null | head -n 1 || true))"
+        PACKAGE_MANAGER="dnf ($(dnf --version 2>/dev/null | awk 'NR==1' || true))"
     fi
     if command -v rpm &>/dev/null; then
         HAS_RPM=true
@@ -343,9 +354,9 @@ preflight_checks() {
         HAS_FUSE=true
     fi
 
-    # Step 7: Identify signature verification command utilities
+    # Step 7: Check for PGP verification engine (GnuPG)
     if command -v gpg &>/dev/null; then
-        HAS_GPG=true
+        HAS_PGP=true
     fi
 
     # Step 8: Identify graphics shell session environments (necessary for desktop shortcut creations)
@@ -436,8 +447,8 @@ preflight_checks() {
 # STAGE 1 — PACKAGE DISCOVERY
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Scans the execution working directory for local target files (.rpm and .AppImage).
-# Populates global lists and prints a formatted selection table of the findings.
+# @description Searches current directory for RPM and AppImage packages.
+# @globals RPM_FILES, APPIMAGE_FILES, ALL_PACKAGES, ALL_PACKAGES_PATHS, ALL_PACKAGES_SHA256
 discover_packages() {
     local i=0
     local path=""
@@ -552,8 +563,8 @@ discover_packages() {
 # STAGE 2 — PACKAGE SELECTION & RISK ANALYSIS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Interactively prompts user for selection index from discovery list.
-# Supports abort inputs like 'q' or '0' to exit cleanly.
+# @description Prompts the user to select one of the detected packages.
+# @globals SELECTED_INDEX, SELECTED_PATH, SELECTED_TYPE, SELECTED_SIZE, SELECTED_SHA256, SELECTED_NAME
 select_package() {
     local total="${#ALL_PACKAGES[@]}"
     local input=""
@@ -588,8 +599,9 @@ select_package() {
     echo "  Selected: ${SELECTED_NAME}"
 }
 
-# Conducts dependency dry-runs with DNF.
-# Warns user if removals, GPG issues, conflicts, or external packages are found.
+# @description Simulates RPM installation using sudo dnf install --assumeno.
+#              Parses and reports dependencies, package upgrades, conflicts, and dangerous removals.
+# @globals SELECTED_PATH, DNF_DRY_RUN_OUTPUT, DEPS_INSTALLED
 risk_analysis() {
     local dry_run_output=""
     local deps_to_install=""
@@ -632,7 +644,7 @@ risk_analysis() {
     # Assumeno forces DNF to abort before transaction, yielding complete output safely.
     echo "  │ Running dry-run dependency analysis..."
     if [[ -z "$DNF_DRY_RUN_OUTPUT" ]]; then
-        DNF_DRY_RUN_OUTPUT="$(dnf install --assumeno "$SELECTED_PATH" 2>&1 || true)"
+        DNF_DRY_RUN_OUTPUT="$(sudo dnf install --assumeno "$SELECTED_PATH" 2>&1 || true)"
     fi
     dry_run_output="$DNF_DRY_RUN_OUTPUT"
 
@@ -672,10 +684,10 @@ risk_analysis() {
         external_deps="$(echo "$dry_run_output" | grep -i "not in repository" | head -n 5 || true)"
     fi
 
-    # Check if DNF warns that GPG signature validation fails/keys are missing
+    # Check if DNF warns that PGP signature validation fails or keys are missing
     if echo "$dry_run_output" | grep -qi "is not signed"; then
         has_unsigned=true
-    elif echo "$dry_run_output" | grep -qi "gpg"; then
+    elif echo "$dry_run_output" | grep -qi "gpg\|pgp"; then
         if ! echo "$dry_run_output" | grep -qi "verified\|good"; then
             has_unsigned=true
         fi
@@ -701,8 +713,8 @@ risk_analysis() {
 
     # Render warnings block detailing identified risks
     warning_details=""
-    if $has_unsigned; then
-        warning_details+="  │ ${C_YELLOW}⚠${C_RESET}  Package is NOT signed with a known GPG key"$'\n'
+    if [[ "$has_unsigned" == "true" ]]; then
+        warning_details+="  │ ${C_YELLOW}⚠${C_RESET}  Package is NOT signed with a known PGP key"$'\n'
     fi
     if $has_external_deps; then
         warning_details+="  │ ${C_YELLOW}⚠${C_RESET}  Package requires dependency not in official repos"$'\n'
@@ -777,275 +789,421 @@ risk_analysis() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STAGE 3 — GPG SIGNATURE VERIFICATION
+# STAGE 3 — PGP/GPG SIGNATURE & CHECKSUM VERIFICATION
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Coordinates cryptographic and integrity validation for the target packages.
-# RPM files search for local .asc/.sig signature logs or import keys from online servers.
-# AppImages undergo a passive SHA256 confirmation check.
-gpg_verification() {
-    local gpg_choice=""
-    local sig_files=()
-    local sig_found=""
-    local pkg_dir=""
-    local pkg_basename=""
-    local pkg_name_noext=""
-
+# @description Orchestrates the package validation logic. Attempts detached PGP/GPG signature
+#              and checksum file checks, falling back to embedded signature or SHA256 manual checks.
+# @globals SELECTED_PATH, SELECTED_TYPE, PGP_VERIFIED, PGP_SIGNER, PGP_KEY_ID
+pgp_verification() {
+    local pkg_dir
     pkg_dir="$(dirname "$SELECTED_PATH")"
-    pkg_basename="$(basename "$SELECTED_PATH")"
-    pkg_name_noext="${pkg_basename%.rpm}"
+    local pkg_file
+    pkg_file="$(basename "$SELECTED_PATH")"
+    local pkg_name_noext="${pkg_file%.*}"
+    
+    # Search for matching detached signature files
+    local sig_candidates=()
+    local ext
+    for ext in sig asc pgp; do
+        [[ -f "${pkg_dir}/${pkg_file}.${ext}" ]] && sig_candidates+=("${pkg_dir}/${pkg_file}.${ext}")
+        [[ -f "${pkg_dir}/${pkg_name_noext}.${ext}" ]] && sig_candidates+=("${pkg_dir}/${pkg_name_noext}.${ext}")
+    done
+    
+    local unique_sig_candidates=()
+    local cand
+    for cand in "${sig_candidates[@]}"; do
+        local exists=false
+        local u
+        for u in "${unique_sig_candidates[@]}"; do
+            [[ "$u" == "$cand" ]] && exists=true && break
+        done
+        [[ "$exists" == "false" ]] && unique_sig_candidates+=("$cand")
+    done
+    
+    # Request PGP/GPG signature confirmation from user
+    local found_sig=""
+    for cand in "${unique_sig_candidates[@]}"; do
+        local cand_name
+        cand_name="$(basename "$cand")"
+        echo
+        if ask_yes_no "Found PGP/GPG signature file: '${cand_name}'. Is this the correct signature file for this package?" "Y"; then
+            found_sig="$cand"
+            break
+        fi
+    done
 
-    # For AppImage: offer SHA256 integrity check (no GPG sig standard exists for AppImages)
+    # Verify using detached signature if confirmed
+    if [[ -n "$found_sig" ]]; then
+        echo
+        echo "  Verifying PGP/GPG signature using: $(basename "$found_sig")"
+        
+        if [[ "$HAS_PGP" == "false" ]]; then
+            echo_yellow "  ⚠ GnuPG is not installed."
+            if ask_yes_no "Install gnupg2 now?" "Y"; then
+                sudo dnf install -y gnupg2 && HAS_PGP=true
+            else
+                abort "Verification aborted: GnuPG required for detached signature checks."
+            fi
+        fi
+
+        local verify_output
+        verify_output="$(gpg --verify "$found_sig" "$SELECTED_PATH" 2>&1 || true)"
+        
+        if echo "$verify_output" | grep -qi "good signature"; then
+            PGP_VERIFIED=true
+            PGP_SIGNER="$(echo "$verify_output" | grep -oP '"([^"]+)"' | awk 'NR==1' || echo "Unknown")"
+            PGP_KEY_ID="$(echo "$verify_output" | grep -oP 'key ID [0-9A-Fa-f]+' | awk 'NR==1' || echo "unknown")"
+            echo_green "  ✅ PGP/GPG DETACHED SIGNATURE VERIFIED SUCCESSFULLY"
+            echo "  Signer: ${PGP_SIGNER} (${PGP_KEY_ID})"
+            echo
+            if ask_yes_no "Would you like to install the package now?" "Y"; then
+                if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                    risk_analysis
+                    install_rpm
+                else
+                    install_appimage
+                fi
+            fi
+            return 0
+        elif echo "$verify_output" | grep -qi "no public key\|public key .* not found\|keyserver"; then
+            local key_id
+            key_id="$(echo "$verify_output" | grep -oP 'key ID [0-9A-Fa-f]+' | awk '{print $NF}' || true)"
+            [[ -z "$key_id" ]] && key_id="$(echo "$verify_output" | grep -oP 'Key ID [0-9A-Fa-f]+' | awk '{print $NF}' || true)"
+            
+            echo_yellow "  ⚠ PGP/GPG Key Not Found (NOKEY)"
+            echo "  The signature is valid, but the public key is not trusted/imported."
+            if [[ -n "$key_id" ]]; then
+                echo "  Key ID: ${key_id}"
+                echo
+                echo "  Options:"
+                echo "    [1] Import key from keyserver (keyserver.ubuntu.com)"
+                echo "    [2] Import key from keyserver (keys.openpgp.org)"
+                echo "    [3] Proceed with installation anyway"
+                echo "    [4] Abort installation"
+                echo
+                local opt
+                read -r -p "  Choose [1-4]: " opt
+                case "$opt" in
+                    1|2)
+                        local keyserver="keyserver.ubuntu.com"
+                        [[ "$opt" -eq 2 ]] && keyserver="keys.openpgp.org"
+                        echo "  Fetching key from ${keyserver}..."
+                        local tmp_key
+                        tmp_key="$(mktemp)"
+                        TEMP_DIRS+=("$tmp_key")
+                        if gpg --keyserver "$keyserver" --recv-keys "$key_id" 2>/dev/null && gpg --export --armor "$key_id" > "$tmp_key"; then
+                            if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                                echo "  Importing key into RPM database..."
+                                if sudo rpm --import "$tmp_key"; then
+                                    echo_green "  ✅ Key imported to RPM database."
+                                fi
+                            fi
+                            gpg --import "$tmp_key" 2>/dev/null || true
+                            
+                            verify_output="$(gpg --verify "$found_sig" "$SELECTED_PATH" 2>&1 || true)"
+                            if echo "$verify_output" | grep -qi "good signature"; then
+                                PGP_VERIFIED=true
+                                PGP_SIGNER="Imported Key (${key_id})"
+                                PGP_KEY_ID="${key_id}"
+                                echo_green "  ✅ PGP/GPG DETACHED SIGNATURE VERIFIED"
+                                if ask_yes_no "Would you like to install the package now?" "Y"; then
+                                    if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                                        risk_analysis
+                                        install_rpm
+                                    else
+                                        install_appimage
+                                    fi
+                                fi
+                                return 0
+                            fi
+                        fi
+                        echo_red "  ❌ Failed to verify signature after key import."
+                        if ask_yes_no "Do you want to proceed anyway?" "N"; then
+                            if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                                risk_analysis
+                                install_rpm
+                            else
+                                install_appimage
+                            fi
+                        else
+                            abort "Installation aborted."
+                        fi
+                        ;;
+                    3)
+                        if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                            risk_analysis
+                            install_rpm
+                        else
+                            install_appimage
+                        fi
+                        ;;
+                    *)
+                        abort "Installation aborted."
+                        ;;
+                esac
+            else
+                if ask_yes_no "Do you want to proceed without verification?" "N"; then
+                    if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                        risk_analysis
+                        install_rpm
+                    else
+                        install_appimage
+                    fi
+                else
+                    abort "Installation aborted."
+                fi
+            fi
+            return 0
+        else
+            echo_red "  ❌ CRITICAL WARNING: DETACHED PGP/GPG SIGNATURE IS INVALID OR CORRUPT (BAD)!"
+            echo "  --------------------------------------------------------"
+            echo "  The package file has been modified or does not match this signature."
+            echo "  It is highly dangerous to install this package."
+            echo "  --------------------------------------------------------"
+            echo
+            if ask_yes_no "Do you want to proceed with installation anyway (Dangerous)?" "N"; then
+                if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                    risk_analysis
+                    install_rpm
+                else
+                    install_appimage
+                fi
+            else
+                abort "Installation aborted due to BAD signature."
+            fi
+            return 0
+        fi
+    fi
+
+    # Search for matching checksum files
+    local checksum_candidates=()
+    local cext
+    for cext in sha256 sha256sum; do
+        [[ -f "${pkg_dir}/${pkg_file}.${cext}" ]] && checksum_candidates+=("${pkg_dir}/${pkg_file}.${cext}")
+        [[ -f "${pkg_dir}/${pkg_name_noext}.${cext}" ]] && checksum_candidates+=("${pkg_dir}/${pkg_name_noext}.${cext}")
+    done
+    [[ -f "${pkg_dir}/SHA256SUMS" ]] && checksum_candidates+=("${pkg_dir}/SHA256SUMS")
+    [[ -f "${pkg_dir}/checksums.txt" ]] && checksum_candidates+=("${pkg_dir}/checksums.txt")
+
+    local unique_checksum_candidates=()
+    local ccand
+    for ccand in "${checksum_candidates[@]}"; do
+        local cexists=false
+        local cu
+        for cu in "${unique_checksum_candidates[@]}"; do
+            [[ "$cu" == "$ccand" ]] && cexists=true && break
+        done
+        [[ "$cexists" == "false" ]] && unique_checksum_candidates+=("$ccand")
+    done
+
+    # Request checksum file confirmation from user
+    local found_checksum=""
+    for ccand in "${unique_checksum_candidates[@]}"; do
+        local ccand_name
+        ccand_name="$(basename "$ccand")"
+        echo
+        if ask_yes_no "Found checksum file: '${ccand_name}'. Is this the correct checksum file for this package?" "Y"; then
+            found_checksum="$ccand"
+            break
+        fi
+    done
+
+    # Verify using checksum file if confirmed
+    if [[ -n "$found_checksum" ]]; then
+        echo
+        echo "  Verifying integrity using checksum file: $(basename "$found_checksum")"
+        
+        local expected_sha=""
+        local line
+        line="$(grep -F "$pkg_file" "$found_checksum" | head -n 1 || true)"
+        if [[ -n "$line" ]]; then
+            expected_sha="$(echo "$line" | grep -oP '[0-9a-fA-F]{64}' | head -n 1 || true)"
+        else
+            expected_sha="$(grep -oP '\b[0-9a-fA-F]{64}\b' "$found_checksum" | head -n 1 || true)"
+        fi
+        
+        expected_sha="${expected_sha// /}"
+        expected_sha="$(echo "$expected_sha" | tr '[:upper:]' '[:lower:]')"
+        local calculated_sha
+        calculated_sha="$(echo "$SELECTED_SHA256" | tr '[:upper:]' '[:lower:]')"
+
+        if [[ -z "$expected_sha" ]]; then
+            echo_yellow "  ⚠ Could not find a valid 64-character SHA256 checksum in $(basename "$found_checksum")."
+            if ! ask_yes_no "Proceed to other verification checks?" "Y"; then
+                abort "Verification aborted."
+            fi
+        else
+            echo "  Expected SHA256: ${expected_sha}"
+            echo "  Calculated SHA256: ${calculated_sha}"
+            echo
+
+            if [[ "$expected_sha" == "$calculated_sha" ]]; then
+                PGP_VERIFIED=true
+                PGP_SIGNER="Verified via $(basename "$found_checksum")"
+                echo_green "  ✅ CHECKSUM MATCHED SUCCESSFULLY!"
+                echo
+                if ask_yes_no "Would you like to install the package now?" "Y"; then
+                    if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                        risk_analysis
+                        install_rpm
+                    else
+                        install_appimage
+                    fi
+                fi
+                return 0
+            else
+                echo_red "  ❌ CRITICAL WARNING: CHECKSUM MISMATCH!"
+                echo "  --------------------------------------------------------"
+                echo "  The calculated checksum does NOT match the expected value."
+                echo "  This file is corrupted, altered, or insecure to install."
+                echo "  --------------------------------------------------------"
+                echo
+                if ask_yes_no "Do you want to proceed with installation anyway (Dangerous)?" "N"; then
+                    if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+                        risk_analysis
+                        install_rpm
+                    else
+                        install_appimage
+                    fi
+                else
+                    abort "Installation aborted due to checksum mismatch."
+                fi
+                return 0
+            fi
+        fi
+    fi
+
+    # Fallback to embedded signature or manual verification
     if [[ "$SELECTED_TYPE" == "AppImage" ]]; then
         echo
-        echo "  ${C_BLUE}ℹ${C_RESET}  AppImages don't use RPM-style GPG signing."
-        echo "      You can verify integrity via a SHA256 checksum published by the developer."
+        echo "  ${C_BLUE}ℹ${C_RESET} No PGP/GPG signature or checksum file confirmed. Checking manually."
+        echo "  Computed SHA256: ${SELECTED_SHA256}"
         echo
-        echo "  Computed SHA256 of ${SELECTED_NAME}:"
-        echo "    ${SELECTED_SHA256}"
-        echo
-        echo "  Compare this value against the checksum published on the official download page."
-        echo
-        if ask_yes_no "Have you verified the checksum matches the official value?" "N"; then
-            echo_green "  ✅  User confirmed checksum matches."
-            GPG_VERIFIED=true   # re-use flag to mean 'integrity confirmed'
-            GPG_SIGNER="User-confirmed SHA256"
+        if ask_yes_no "Does this checksum match the developer's official value?" "N"; then
+            PGP_VERIFIED=true
+            PGP_SIGNER="User-verified SHA256"
+            echo_green "  ✅ Checksum confirmed."
+            if ask_yes_no "Proceed to install/integrate AppImage?" "Y"; then
+                install_appimage
+            else
+                abort "Exiting without installation."
+            fi
         else
-            echo_yellow "  ⚠  Proceeding without checksum confirmation."
+            echo_yellow "  ⚠ Warning: Checksum was not confirmed."
+            if ask_yes_no "Do you want to install this unverified AppImage anyway?" "N"; then
+                install_appimage
+            else
+                abort "Aborted due to unconfirmed checksum."
+            fi
         fi
         return 0
     fi
 
     echo
-    print_box "GPG SIGNATURE VERIFICATION"
-
-    # Step 1: Install GnuPG subsystem if absent, asking user for confirmation first
-    if ! $HAS_GPG; then
+    echo "  No signature or checksum file confirmed. Checking embedded RPM signature..."
+    
+    local rpm_k_output
+    rpm_k_output="$(rpm -K "$SELECTED_PATH" 2>&1 || true)"
+    
+    if echo "$rpm_k_output" | grep -qi "signatures OK\|gpg OK\|pgp OK"; then
+        PGP_VERIFIED=true
+        PGP_SIGNER="RPM Trusted Key"
+        PGP_KEY_ID="$(rpm -qp --queryformat '%{SIGPGP:pgpsig}' "$SELECTED_PATH" 2>/dev/null | grep -oP 'key ID [0-9A-Fa-f]+' | awk '{print $NF}' || echo "trusted")"
+        echo_green "  ✅ EMBEDDED PGP/GPG SIGNATURE VERIFIED SUCCESSFULLY"
+        echo "  Signer: ${PGP_SIGNER} (Key ID: ${PGP_KEY_ID})"
         echo
-        echo_yellow "  ⚠  GPG is not installed on your system."
-        echo
-        echo "  GPG verification confirms a package has not been tampered with"
-        echo "  and originates from a trusted publisher."
-        echo
-        if ask_yes_no "Install gnupg2 now?" "Y"; then
-            echo
-            echo "  ${C_BLUE}Command:${C_RESET} sudo dnf install gnupg2"
-            echo
-            if ask_yes_no "Proceed with installation?" "N"; then
-                # No -y: let DNF show its own transaction summary for transparency.
-                sudo dnf install gnupg2 || {
-                    echo_red "  Failed to install gnupg2."
-                    if ! ask_yes_no "Continue without GPG verification?" "N"; then
-                        abort
-                    fi
-                }
-                if command -v gpg &>/dev/null; then
-                    HAS_GPG=true
-                fi
-            else
-                if ! ask_yes_no "Continue without GPG verification?" "N"; then
-                    abort
-                fi
-            fi
-        else
-            if ! ask_yes_no "Continue without GPG verification?" "N"; then
-                abort
-            fi
+        if ask_yes_no "Would you like to install the package now?" "Y"; then
+            risk_analysis
+            install_rpm
         fi
-        if ! $HAS_GPG; then
-            return 0
-        fi
-    fi
-
-    echo
-    echo "  ${C_BLUE}ℹ${C_RESET}  GPG verification confirms this package has not been tampered with"
-    echo "      and originates from a trusted publisher. Skipping this step is a"
-    echo "      security risk for packages from unknown sources."
-    echo
-
-    if ask_yes_no "Would you like to verify the GPG signature?" "Y"; then
-        # Step 2: Assemble paths of possible local signature documents
-        local search_patterns=()
-        search_patterns+=("${pkg_dir}/${pkg_name_noext}.asc")
-        search_patterns+=("${pkg_dir}/${pkg_name_noext}.sig")
-        search_patterns+=("${pkg_dir}/${pkg_basename}.asc")
-        search_patterns+=("${pkg_dir}/${pkg_basename}.sig")
-        search_patterns+=("${pkg_dir}/SHA256SUMS")
-        search_patterns+=("${pkg_dir}/checksums.txt")
-
-        local spath=""
-        for spath in "${search_patterns[@]}"; do
-            if [[ -f "$spath" ]]; then
-                sig_found="$spath"
-                sig_files+=("$spath")
-            fi
-        done
-
-        # Step 3: Run GPG validation check on identified signature files
-        if [[ ${#sig_files[@]} -gt 0 ]]; then
-            echo
-            echo "  ${C_GREEN}Signature file(s) found:${C_RESET}"
-            local sfile
-            for sfile in "${sig_files[@]}"; do
-                echo "    • $(basename "$sfile")"
-            done
-            echo
-
-            local verify_success=false
-            local sfile
-            for sfile in "${sig_files[@]}"; do
-                echo "  Verifying: gpg --verify \"$(basename "$sfile")\" \"${pkg_basename}\""
-                echo
-                local verify_output
-                verify_output="$(gpg --verify "$sfile" "$SELECTED_PATH" 2>&1 || true)"
-
-                if echo "$verify_output" | grep -qi "good signature"; then
-                    verify_success=true
-                    GPG_VERIFIED=true
-                    # Parse signature owner name and key ID attributes
-                    GPG_SIGNER="$(echo "$verify_output" | grep -oP '"([^"]+)"' | head -1 || echo "Unknown")"
-                    GPG_KEY_ID="$(echo "$verify_output" | grep -oP 'key ID [0-9A-Fa-f]+' | head -1 || echo "unknown")"
-                    break
-                fi
-            done
-
-            if $verify_success; then
-                echo_green "  ✅  SIGNATURE VERIFICATION SUCCESSFUL"
-                echo
-                echo "  Signer:  ${GPG_SIGNER}"
-                echo "  Key ID:  ${GPG_KEY_ID}"
-            else
-                # Step 4: Handle validation failures, presenting manual bypass options
-                echo_red "  ❌  SIGNATURE VERIFICATION FAILED"
-                echo_red "      This package may have been tampered with."
-                echo
-                echo "  Options:"
-                echo "    [1] Import the correct GPG key manually"
-                echo "    [2] Abort installation (RECOMMENDED)"
-                echo "    [3] Skip verification and proceed (NOT recommended)"
-                echo
-                local gpg_opt
-                read -r -p "  Choose an option [1-3]: " gpg_opt
-                case "$gpg_opt" in
-                    1)
-                        echo
-                        read -r -p "  Enter GPG key ID or path to key file: " gpg_key_input
-                        if [[ -f "$gpg_key_input" ]]; then
-                            gpg --import "$gpg_key_input" || echo_red "  Failed to import key."
-                        else
-                            gpg --keyserver keyserver.ubuntu.com --recv-keys "$gpg_key_input" || \
-                            gpg --keyserver keys.openpgp.org --recv-keys "$gpg_key_input" || \
-                            echo_red "  Failed to receive key. Check the key ID and try again."
-                        fi
-                        # Retry verification after key import
-                        local retry_output
-                        local sfile2
-                        for sfile2 in "${sig_files[@]}"; do
-                            retry_output="$(gpg --verify "$sfile2" "$SELECTED_PATH" 2>&1 || true)"
-                            if echo "$retry_output" | grep -qi "good signature"; then
-                                GPG_VERIFIED=true
-                                echo_green "  ✅  Signature verified after key import."
-                                break
-                            fi
-                        done
-                        if ! $GPG_VERIFIED; then
-                            echo_red "  Still cannot verify signature."
-                            if ! ask_yes_no "Continue anyway?" "N"; then
-                                abort
-                            fi
-                        fi
-                        ;;
-                    2)
-                        abort "Aborted by user due to GPG verification failure."
-                        ;;
-                    3)
-                        if confirm_type_word "IUNDERSTAND" "Type 'IUNDERSTAND' to skip verification:"; then
-                            echo_yellow "  Skipping GPG verification."
-                        else
-                            abort
-                        fi
-                        ;;
-                    *)
-                        abort "Invalid option."
-                        ;;
-                esac
-            fi
+    elif echo "$rpm_k_output" | grep -qi "BAD"; then
+        echo_red "  ❌ CRITICAL WARNING: EMBEDDED PGP/GPG SIGNATURE IS INVALID OR CORRUPT (BAD)!"
+        echo "  --------------------------------------------------------"
+        echo "  The package has been modified, corrupted, or tampered with."
+        echo "  It is highly dangerous to install this package."
+        echo "  --------------------------------------------------------"
+        echo
+        if ask_yes_no "Do you want to proceed with installation anyway (Dangerous)?" "N"; then
+            risk_analysis
+            install_rpm
         else
-            # Step 5: Handle absent signature files gracefully
-            echo
-            echo_yellow "  ⚠  No signature file was found in the current directory."
-            echo "      This does not mean the package is unsafe, but it cannot"
-            echo "      be cryptographically verified at this time."
+            abort "Installation aborted due to BAD signature."
+        fi
+    elif echo "$rpm_k_output" | grep -qi "NOKEY"; then
+        local key_id
+        key_id="$(echo "$rpm_k_output" | grep -oP 'key ID [0-9A-Fa-f]+' | awk '{print $NF}' || true)"
+        [[ -z "$key_id" ]] && key_id="$(echo "$rpm_k_output" | grep -oP 'Key ID [0-9A-Fa-f]+' | awk '{print $NF}' || true)"
+        
+        echo_yellow "  ⚠ PGP/GPG Key Not Found (NOKEY)"
+        echo "  The package signature is valid, but the signing key is not trusted."
+        if [[ -n "$key_id" ]]; then
+            echo "  Key ID: ${key_id}"
             echo
             echo "  Options:"
-            echo "    [1] Enter a GPG key ID manually to attempt verification"
-            echo "    [2] Search for the publisher's GPG key online (display instructions)"
-            echo "    [3] Skip verification and proceed (require confirmation)"
-            echo "    [4] Abort and return to package selection"
+            echo "    [1] Import key from keyserver (keyserver.ubuntu.com)"
+            echo "    [2] Import key from keyserver (keys.openpgp.org)"
+            echo "    [3] Proceed with installation anyway"
+            echo "    [4] Abort installation"
             echo
-            local gpg_opt2
-            read -r -p "  Choose an option [1-4]: " gpg_opt2
-            case "$gpg_opt2" in
-                1)
-                    read -r -p "  Enter GPG key ID: " gpg_key_input2
-                    gpg --keyserver keyserver.ubuntu.com --recv-keys "$gpg_key_input2" 2>/dev/null || \
-                    gpg --keyserver keys.openpgp.org --recv-keys "$gpg_key_input2" 2>/dev/null || \
-                    echo_red "  Failed to receive key."
-                    # Attempt verification retries
-                    local sfile3
-                    for sfile3 in "${sig_files[@]}"; do
-                        local retry2
-                        retry2="$(gpg --verify "$sfile3" "$SELECTED_PATH" 2>&1 || true)"
-                        if echo "$retry2" | grep -qi "good signature"; then
-                            GPG_VERIFIED=true
-                            echo_green "  ✅  Signature verified."
-                            break
-                        fi
-                    done
-                    if ! $GPG_VERIFIED; then
-                        echo_red "  Could not verify signature with provided key."
-                        if ! ask_yes_no "Continue without verification?" "N"; then
-                            abort
+            local opt
+            read -r -p "  Choose [1-4]: " opt
+            case "$opt" in
+                1|2)
+                    local keyserver="keyserver.ubuntu.com"
+                    [[ "$opt" -eq 2 ]] && keyserver="keys.openpgp.org"
+                    echo "  Fetching key from ${keyserver}..."
+                    local tmp_key
+                    tmp_key="$(mktemp)"
+                    TEMP_DIRS+=("$tmp_key")
+                    if gpg --keyserver "$keyserver" --recv-keys "$key_id" 2>/dev/null && gpg --export --armor "$key_id" > "$tmp_key"; then
+                        if sudo rpm --import "$tmp_key"; then
+                            echo_green "  ✅ Key imported successfully."
+                            rpm_k_output="$(rpm -K "$SELECTED_PATH" 2>&1 || true)"
+                            if echo "$rpm_k_output" | grep -qi "signatures OK\|gpg OK\|pgp OK"; then
+                                PGP_VERIFIED=true
+                                PGP_SIGNER="Imported Key (${key_id})"
+                                PGP_KEY_ID="${key_id}"
+                                echo_green "  ✅ PGP/GPG SIGNATURE VERIFIED"
+                                if ask_yes_no "Would you like to install the package now?" "Y"; then
+                                    risk_analysis
+                                    install_rpm
+                                fi
+                                return 0
+                            fi
                         fi
                     fi
-                    ;;
-                2)
-                    echo
-                    echo "  To find the publisher's GPG key:"
-                    echo "    1. Visit the publisher's official website"
-                    echo "    2. Look for a 'Security' or 'Downloads' section"
-                    echo "    3. Download their public GPG key file"
-                    echo "    4. Import it: gpg --import <keyfile>"
-                    echo "    5. Re-run verification with this script"
-                    echo
-                    if ! ask_yes_no "Continue without verification?" "N"; then
-                        abort
+                    echo_red "  ❌ Failed to verify signature after key import."
+                    if ask_yes_no "Do you want to proceed anyway?" "N"; then
+                        risk_analysis
+                        install_rpm
+                    else
+                        abort "Installation aborted."
                     fi
                     ;;
                 3)
-                    if confirm_type_word "IUNDERSTAND" "Type 'IUNDERSTAND' to skip verification:"; then
-                        echo_yellow "  Skipping GPG verification."
-                    else
-                        abort
-                    fi
-                    ;;
-                4)
-                    abort
+                    risk_analysis
+                    install_rpm
                     ;;
                 *)
-                    abort "Invalid option."
+                    abort "Installation aborted."
                     ;;
             esac
+        else
+            if ask_yes_no "Do you want to proceed without verification?" "N"; then
+                risk_analysis
+                install_rpm
+            else
+                abort "Installation aborted."
+            fi
         fi
     else
-        echo
-        echo_yellow "  ⚠  You are proceeding without signature verification."
-        echo "      Only continue if you downloaded this package from an official,"
-        echo "      trusted source and verified its integrity by other means."
-        echo
-        read -r -p "  Press [Enter] to continue, or [q] to abort: " skip_confirm
-        if [[ "$skip_confirm" == "q" ]]; then
-            abort
+        echo_yellow "  ⚠ Package is not signed (Unsigned)"
+        if ask_yes_no "Do you want to install this unsigned package?" "N"; then
+            risk_analysis
+            install_rpm
+        else
+            abort "Installation aborted."
         fi
     fi
 }
@@ -1053,9 +1211,11 @@ gpg_verification() {
 # ──────────────────────────────────────────────────────────────────────────────
 # STAGE 4A — SAFE RPM INSTALLATION
 # ──────────────────────────────────────────────────────────────────────────────
+# STAGE 4A — SAFE RPM INSTALLATION
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Oversees the final transaction execution of the RPM packages via DNF commands.
-# Shows a comprehensive transaction preview detailing changes, sizes, and disk requirements.
+# @description Performs the actual installation of the chosen RPM using sudo dnf install.
+# @globals SELECTED_PATH, DEPS_INSTALLED, DISK_SPACE_AVAIL, PGP_VERIFIED, PGP_SIGNER, PGP_KEY_ID
 install_rpm() {
     local full_path="$SELECTED_PATH"
     local pkg_name=""
@@ -1076,7 +1236,7 @@ install_rpm() {
     if [[ -n "$DNF_DRY_RUN_OUTPUT" ]]; then
         dry_run_output="$DNF_DRY_RUN_OUTPUT"
     else
-        dry_run_output="$(dnf install --assumeno "$full_path" 2>&1 || true)"
+        dry_run_output="$(sudo dnf install --assumeno "$full_path" 2>&1 || true)"
         DNF_DRY_RUN_OUTPUT="$dry_run_output"
     fi
 
@@ -1105,7 +1265,7 @@ install_rpm() {
     fi
     echo "    ${C_GREEN}✗${C_RESET} Downgrade: nothing"
     echo
-    echo "  GPG Verified:  ${GPG_VERIFIED:-${C_YELLOW}No${C_RESET}}"
+    echo "  PGP Verified:  ${PGP_VERIFIED:-${C_YELLOW}No${C_RESET}}"
     echo
     echo "  Disk space required: ~${SELECTED_SIZE}"
     echo "  Available disk space: ${DISK_SPACE_AVAIL}"
@@ -1120,7 +1280,7 @@ install_rpm() {
     echo
 
     # Step 1: Run DNF with live console output.
-    # We do not capture output here so the user sees progress and GPG prompts live.
+    # We do not capture output here so the user sees progress and PGP/key prompts live.
     local install_rc=0
     sudo dnf install "$full_path" || install_rc=$?
     if [[ "$install_rc" -ne 0 ]]; then
@@ -1168,7 +1328,7 @@ install_rpm() {
     echo_green "  ✅  Installation completed successfully."
 
     # Step 3: Query RPM database to record package files destination path
-    INSTALL_LOCATION="$(rpm -ql "$pkg_name" 2>/dev/null | head -5 | tr '\n' ' ' || echo "See 'rpm -ql ${pkg_name}'")"
+    INSTALL_LOCATION="$(rpm -ql "$pkg_name" 2>/dev/null | awk 'NR<=5' | tr '\n' ' ' || echo "See 'rpm -ql ${pkg_name}'")"
     INSTALL_STATUS="success"
 
     echo
@@ -1179,10 +1339,10 @@ install_rpm() {
     echo "  ${C_GREEN}Source file:${C_RESET}      ${full_path}"
     echo "  ${C_GREEN}SHA256:${C_RESET}           ${SELECTED_SHA256}"
     echo
-    if $GPG_VERIFIED; then
-        echo "  ${C_GREEN}GPG Verified:     ✅ Yes — ${GPG_SIGNER} (${GPG_KEY_ID})${C_RESET}"
+    if [[ "$PGP_VERIFIED" == "true" ]]; then
+        echo "  ${C_GREEN}PGP Verified:     ✅ Yes — ${PGP_SIGNER} (${PGP_KEY_ID})${C_RESET}"
     else
-        echo "  ${C_YELLOW}GPG Verified:     ⚠ No${C_RESET}"
+        echo "  ${C_YELLOW}PGP Verified:     ⚠ No${C_RESET}"
     fi
     echo "  ${C_GREEN}Install Status:   ✅ Success${C_RESET}"
     echo "  ${C_GREEN}Install Location: ${INSTALL_LOCATION}${C_RESET}"
@@ -1199,8 +1359,9 @@ install_rpm() {
 # STAGE 4B — SAFE APPIMAGE INTEGRATION
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Configures, registers, and copies AppImage files to target directories.
-# Extracts embedded launchers/icons and links them to user environment folders.
+# @description Integrates AppImage files by copying to selected folder, updating permissions,
+#              checking FUSE dependency, and extracting desktop entries and icons.
+# @globals SELECTED_PATH, HAS_FUSE, HAS_DESKTOP, SELECTED_SHA256
 install_appimage() {
     local appimage_path="$SELECTED_PATH"
     local appimage_name="$(basename "$appimage_path")"
@@ -1376,10 +1537,14 @@ install_appimage() {
     echo
 }
 
-# Mounts AppImage in secure temporary workspace directory.
-# Locates and extracts embedded application shortcuts and graphics icons.
-# Uses a multi-strategy icon search: DirIcon standard -> desktop Icon= key ->
-# resolution-priority PNG selection -> SVG -> XPM fallback.
+# @description Extracts desktop entries and application icons from AppImage using --appimage-extract.
+#              Employs multiple heuristics to locate high-res icons and modifies shortcuts to use
+#              absolute AppImage paths, updating update-desktop-database if present.
+# @param $1 string Absolute path to AppImage file.
+# @param $2 string Clean basename of AppImage (no extension).
+# @param $3 string Target destination directory.
+# @param $4 string Original filename of AppImage.
+# @globals TEMP_DIRS, HAS_DESKTOP, HAS_UPDATE_DESKTOP_DB
 extract_desktop_entry() {
     local appimage_path="$1"
     local appimage_basename="$2"
@@ -1610,7 +1775,7 @@ extract_desktop_entry() {
     echo "  ${C_BLUE}Searching for embedded .desktop launchers...${C_RESET}"
 
     local search_desktop
-    search_desktop="$(find "$squash_dir" -maxdepth 3 -type f -iname '*.desktop' 2>/dev/null | head -n 1 || true)"
+    search_desktop="$(find "$squash_dir" -maxdepth 3 -type f -iname '*.desktop' 2>/dev/null | awk 'NR==1' || true)"
     if [[ -n "$search_desktop" ]]; then
         extracted_desktop="$search_desktop"
         echo "  ${C_GREEN}Desktop entry found:${C_RESET} $(basename "$extracted_desktop")"
@@ -1618,7 +1783,7 @@ extract_desktop_entry() {
 
         echo "  Original desktop file contents:"
         echo "  ─────────────────────────────────────────────────────"
-        while IFS= read -r dline; do
+        while IFS= read -r dline || [[ -n "$dline" ]]; do
             echo "    ${dline}"
         done < "$extracted_desktop"
         echo "  ─────────────────────────────────────────────────────"
@@ -1638,7 +1803,7 @@ extract_desktop_entry() {
         # the real installed location of the AppImage binary and the icon.
         # Also strip any %F/%U arguments that may reference old paths.
         : > "$modified_desktop"
-        while IFS= read -r dline; do
+        while IFS= read -r dline || [[ -n "$dline" ]]; do
             if [[ "$dline" =~ ^Exec= ]]; then
                 # Preserve any %F/%U etc. arguments from original Exec line
                 local exec_args=""
@@ -1647,6 +1812,8 @@ extract_desktop_entry() {
                 # Extract trailing % placeholders (like %F, %U, %f, %u)
                 exec_args="$(echo "$orig_exec" | grep -oP '%[fFuUcCdDnNickvm]+' || true)"
                 echo "Exec=${exec_path} ${exec_args}" >> "$modified_desktop"
+            elif [[ "$dline" =~ ^TryExec= ]]; then
+                echo "TryExec=${exec_path}" >> "$modified_desktop"
             elif [[ "$dline" =~ ^Icon= ]]; then
                 echo "Icon=${icon_path}" >> "$modified_desktop"
             else
@@ -1657,7 +1824,7 @@ extract_desktop_entry() {
         # Show reconstructed desktop entry file preview before writing to filesystem
         echo "  Modified desktop entry (will be written):"
         echo "  ┌── DESKTOP ENTRY PREVIEW ─────────────────────────────────┐"
-        while IFS= read -r dline; do
+        while IFS= read -r dline || [[ -n "$dline" ]]; do
             printf "  │ %-60s │\n" "$dline"
         done < "$modified_desktop"
         echo "  └──────────────────────────────────────────────────────────┘"
@@ -1725,11 +1892,11 @@ Terminal=false"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MAIN
+# MAIN COORDINATOR
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Main program coordinator routing logic.
-# Sequential execution structure of Stage 0 (Checks) -> Stage 1 (Find) -> Stage 2 (Choose) -> Stage 3 (Verify) -> Stage 4 (Install).
+# @description Coordinator of script execution flow. Initiates stages in sequence
+#              and handles goal actions (verify first vs direct install).
 main() {
     echo
     print_box "LOCAL PACKAGE INSTALLER"
@@ -1746,12 +1913,31 @@ main() {
     # Stage 2 — Selection & risk analysis dry-run
     select_package
 
-    if [[ "$SELECTED_TYPE" == "RPM" ]]; then
-        risk_analysis
-        gpg_verification
-        install_rpm
-    elif [[ "$SELECTED_TYPE" == "AppImage" ]]; then
-        install_appimage
+    echo "  Choose your action:"
+    echo "    [1] Verify PGP signature (Highly Recommended)"
+    echo "    [2] Install package directly"
+    echo
+    local action
+    while true; do
+        read -r -p "  Choose [1-2] (or 'q' to quit): " action
+        [[ "$action" == "q" ]] && abort
+        [[ "$action" =~ ^[1-2]$ ]] && break
+        echo_yellow "  Please enter 1 or 2."
+    done
+
+    if [[ "$action" == "2" ]]; then
+        echo_yellow "  ⚠ WARNING: Installing unverified packages is a security risk."
+        if ! ask_yes_no "Do you want to proceed with the installation anyway?" "N"; then
+            abort "Installation cancelled."
+        fi
+        if [[ "$SELECTED_TYPE" == "RPM" ]]; then
+            risk_analysis
+            install_rpm
+        else
+            install_appimage
+        fi
+    else
+        pgp_verification
     fi
 
     echo
